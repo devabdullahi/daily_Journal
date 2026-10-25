@@ -1,0 +1,297 @@
+#!/usr/bin/env bash
+# Export the Round 16 studio for one painter: the easel binary and notes,
+# no source.
+#
+#   scripts/export_r16_studio <profile> <dest>
+#
+# profile: friedrich    its 16-tube box, the guide, the materials note
+#                       (notes/research/friedrich_materials.md) and the physics note
+#          blank        the guide and the physics note; nothing a painter can
+#                       read names a painter (checked below)
+#          sargent      the guide (its tube table the profile's box's), the
+#          inness       physics note, the artist's materials note
+#          alma-tadema  (notes/research/<artist>_materials.md) and bin/box, which
+#          tonn         records the profile for export scripts; nothing a
+#          hopper       painter can read names another painter (the
+#          giverny      impressionist studio's note names the painters
+#          impressionist in whose paintings its box was found)
+#          every        every tube in the catalog, the guide, the physics note and
+#                       the materials note on the box's paints
+#                       (notes/research/every_materials.md); nothing names a painter
+# dest:    a folder that doesn't exist yet (or is empty)
+#
+# dest gets:
+#   bin/easel                  the shared default-feature easel binary
+#   bin/studio                 runtime selection (notes/easel.md, Studio selection)
+#   bin/box                    profile metadata for export scripts (box profiles only)
+#   bin/THIRD_PARTY_NOTICES.md the license notices the binary requires, shipped
+#                              next to it (not at the studio root, where painters browse)
+#   notes/easel_guide.md, notes/techniques.md (rounds that have it), notes/research/..., notes/journal.md (empty)
+#   notes/reference-library.json  the reference library; the every and blank studios,
+#                              whose painter chooses its own subject, get it without
+#                              the entries on particular subjects ("subject" in its manifest)
+#   paintings/lua/             (empty; the session log goes here)
+#
+# The guide's tube table is the one the studio's easel prints for its box
+# (`easel tubes --markdown`); for the default box that is the committed
+# guide's own, byte for byte (checked below).
+#
+# The binary is built from a `git archive` of the branch or tag (R16_BRANCH,
+# default HEAD) in <repo>/target/studio-build/code-<hash>, so it is built
+# from committed code only. Exports may run at once: the archive is
+# extracted under a lock, and one universal binary builds under a second
+# lock in <code-hash>/target/universal. STUDIO_BUILDS moves <repo>/target/studio-build elsewhere
+# (scripts/tests/export_concurrent.sh builds from nothing there).
+# STUDIO_BUILD_HOOK, for that test: a program run with "universal" once
+# after the build and before the binary is published to the cache.
+#
+# Delivery renders use the same default-feature build outside the studio;
+# it replays every box, reading the box from the log.
+set -euo pipefail
+
+usage() { echo "usage: $0 friedrich|blank|sargent|inness|alma-tadema|tonn|hopper|giverny|impressionist|seurat|cezanne|every|watercolor <dest>" >&2; exit 2; }
+[ $# -eq 2 ] || usage
+profile=$1
+dest=$2
+# each profile's box (none: the default tube box), materials note and the
+# painter's names the studio may hold (its own artist's)
+case "$profile" in
+  watercolor) box=watercolor; materials=; own=() ;;
+  blank) box=; materials=; own=() ;;
+  friedrich) box=friedrich; materials=friedrich_materials.md; own=(Friedrich) ;;
+  sargent) box=sargent; materials=sargent_materials.md; own=(Sargent) ;;
+  inness) box=inness; materials=inness_materials.md; own=(Inness) ;;
+  alma-tadema) box=alma-tadema; materials=alma_tadema_materials.md; own=(Alma-Tadema Tadema) ;;
+  tonn) box=tonn; materials=tonn_materials.md; own=(Tonn) ;;
+  hopper) box=hopper; materials=hopper_materials.md; own=(Hopper) ;;
+  giverny) box=giverny; materials=giverny_materials.md; own=(Monet) ;;
+  seurat) box=seurat; materials=seurat_materials.md; own=(Seurat) ;;
+  cezanne) box=cezanne; materials=cezanne_materials.md; own=(Cézanne) ;;
+  every) box=every; materials=every_materials.md; own=() ;;
+  impressionist) box=impressionist; materials=impressionist_materials.md; own=(Monet Renoir Pissarro Sisley Morisot Degas Cézanne Seurat) ;;
+  *) usage ;;
+esac
+# Studio selection is documented in notes/easel.md. STUDIO_WIDTH=4800
+# writes bin/width (unset: 2400, no file).
+unset EASEL_BOX EASEL_WIDTH
+width=${STUDIO_WIDTH:-}
+case "$width" in ''|2400|4800) ;; *) echo "STUDIO_WIDTH=$width: want 2400 or 4800" >&2; exit 2 ;; esac
+[ "$profile" != watercolor ] || [ "${width:-2400}" = 2400 ] || { echo "STUDIO_WIDTH=$width: the watercolor studio has no width option" >&2; exit 2; }
+
+repo=$(cd "$(dirname "$0")/.." && pwd)
+branch=${R16_BRANCH:-HEAD}
+git -C "$repo" rev-parse --verify -q "$branch^{commit}" >/dev/null || { echo "no branch or tag $branch in $repo" >&2; exit 1; }
+# the commit, also for a tag (whose own hash would name another build of the same code)
+sha=$(git -C "$repo" rev-parse --short "$branch^{commit}")
+
+if [ -e "$dest" ] && [ -n "$(ls -A "$dest" 2>/dev/null)" ]; then
+  echo "$dest exists and isn't empty" >&2
+  exit 1
+fi
+mkdir -p "$dest"
+dest=$(cd "$dest" && pwd)
+
+# lock <file>: an exclusive lock on <file>, held on fd 9 until `unlock` (or
+# exit; the kernel drops it with the process, so a killed export leaves no
+# stale lock). perl's flock locks the open file the shell holds on fd 9.
+lock() {
+  exec 9>"$1"
+  perl -MFcntl=:flock -e 'open(my $f, ">&=", 9) or die "lock: fd 9: $!\n"; flock($f, LOCK_EX) or die "lock: $!\n"'
+}
+unlock() { exec 9>&-; }
+
+# Build from committed source; watercolor keeps its separate engine.
+builds=${STUDIO_BUILDS:-$repo/target/studio-build}
+if [ "$profile" = watercolor ]; then
+  code=$(git -C "$repo" rev-parse "$branch:experiments/watercolor")
+  src="$builds/watercolor-$code"
+  built="$src/target/release/watercolor-studio"
+  mkdir -p "$builds"
+  lock "$builds/watercolor-$code.lock"
+  if [ ! -x "$built" ]; then
+    mkdir -p "$src"
+    git -C "$repo" archive --format=tar "$branch" -- experiments/watercolor | tar -x -C "$src"
+    CARGO_TARGET_DIR="$src/target" cargo build --locked --release --manifest-path "$src/experiments/watercolor/Cargo.toml" --bin watercolor-studio
+  fi
+  unlock
+  mkdir -p "$dest/bin/mcp" "$dest/notes" "$dest/paintings/lua"
+  cp "$built" "$dest/bin/watercolor-studio"
+  git -C "$repo" show "$branch:experiments/watercolor/THIRD_PARTY_NOTICES.md" > "$dest/bin/THIRD_PARTY_NOTICES.md"
+  git -C "$repo" show "$branch:notes/watercolor_easel_guide.md" > "$dest/notes/watercolor_easel_guide.md"
+  cp "$dest/notes/watercolor_easel_guide.md" "$dest/notes/easel_guide.md"
+  git -C "$repo" archive --format=tar "$branch" -- notes/watercolor_techniques.md notes/research/watercolor_physics.md | tar -x -C "$dest"
+  "$repo/scripts/strip_sources" "$dest/notes/research/watercolor_physics.md" < /dev/null || { echo "can't strip the sources from the watercolor physics note" >&2; exit 1; }
+  for file in server.py tools.json remote.py http_server.py; do
+    git -C "$repo" show "$branch:harness/easel_mcp/$file" > "$dest/bin/mcp/$file"
+  done
+  if git -C "$repo" cat-file -e "$branch:harness/easel_mcp/references.py" 2>/dev/null; then
+    git -C "$repo" show "$branch:harness/easel_mcp/references.py" > "$dest/bin/mcp/references.py"
+  fi
+  if git -C "$repo" cat-file -e "$branch:notes/reference-library/manifest.json" 2>/dev/null; then
+    "$repo/scripts/build_reference_library" --ref "$branch" "$dest/notes/reference-library.json"
+  fi
+  : > "$dest/notes/journal.md"
+  echo watercolor > "$dest/bin/box"
+  "$dest/bin/watercolor-studio" --box watercolor init "$dest"
+  echo "exported the watercolor studio from $branch ($sha) to $dest"
+  exit 0
+fi
+# the build is named by the code it compiles (the trees of crates/ and .cargo and the Cargo files at
+# $branch), not by the commit: commits that change only notes or scripts reuse the same build
+code=$(for p in crates .cargo Cargo.toml Cargo.lock; do
+         git -C "$repo" rev-parse -q --verify "$branch^{commit}:$p" || echo "no $p"
+       done | shasum | cut -c1-12)
+src="$builds/code-$code"
+built="$src/built/universal/easel"
+if [ ! -x "$built" ]; then
+  mkdir -p "$builds"
+  lock "$builds/code-$code.lock"
+  if [ ! -f "$src/.extracted" ]; then
+    rm -rf "$src"
+    mkdir -p "$src"
+    git -C "$repo" archive --format=tar "$branch" -- .cargo Cargo.toml Cargo.lock crates | tar -x -C "$src"
+    touch "$src/.extracted"
+  fi
+  unlock
+  mkdir -p "$src/built"
+  lock "$src/built/universal.lock"
+  if [ ! -x "$built" ]; then
+    target="$src/target/universal"
+    build() { (cd "$src" && CARGO_TARGET_DIR="$target" cargo build --release -p easel); }
+    if ! out=$(build 2>&1); then
+      if [ "$(uname -s)" = Darwin ] && grep -qi 'license' <<<"$out"; then
+        DEVELOPER_DIR=/Library/Developer/CommandLineTools build
+      else
+        echo "$out" >&2
+        exit 1
+      fi
+    fi
+    [ -x "$target/release/easel" ] || { echo "no easel built in $target" >&2; exit 1; }
+    [ -z "${STUDIO_BUILD_HOOK:-}" ] || "$STUDIO_BUILD_HOOK" universal || { echo "STUDIO_BUILD_HOOK failed" >&2; exit 1; }
+    mkdir -p "$(dirname "$built")"
+    cp "$target/release/easel" "$built.part"
+    mv "$built.part" "$built"
+  fi
+  unlock
+fi
+
+# what a painter gets
+mkdir -p "$dest/bin" "$dest/paintings/lua"
+cp "$built" "$dest/bin/easel"
+printf 'painter %s\n' "${box:-none}" > "$dest/bin/studio"
+[ -z "$box" ] || echo "$box" > "$dest/bin/box"
+[ -z "$width" ] || echo "$width" > "$dest/bin/width"
+notes=(notes/easel_guide.md notes/research/oil_paint_physics.md)
+# Older rounds may not have the techniques handbook.
+! git -C "$repo" cat-file -e "$branch:notes/techniques.md" 2>/dev/null || notes+=(notes/techniques.md)
+if [ -n "$materials" ]; then
+  if [ "$profile" != tonn ] || git -C "$repo" cat-file -e "$branch:notes/research/$materials" 2>/dev/null; then
+    notes+=("notes/research/$materials")
+  fi
+fi
+git -C "$repo" archive --format=tar "$branch" -- "${notes[@]}" | tar -x -C "$dest"
+if [ "$profile" = cezanne ]; then
+  git -C "$repo" archive --format=tar "$branch" -- notes/cezanne_techniques.md notes/research/cezanne_oil_paint_physics.md | tar -x -C "$dest"
+  mv "$dest/notes/cezanne_techniques.md" "$dest/notes/techniques.md"
+  mv "$dest/notes/research/cezanne_oil_paint_physics.md" "$dest/notes/research/oil_paint_physics.md"
+fi
+git -C "$repo" archive --format=tar "$branch" -- THIRD_PARTY_NOTICES.md | tar -x -C "$dest/bin"
+[ -s "$dest/bin/THIRD_PARTY_NOTICES.md" ] || { echo "no bin/THIRD_PARTY_NOTICES.md in $dest" >&2; exit 1; }
+: > "$dest/notes/journal.md"
+# the painter's copy of each research note has no sources (keys, URLs, the Sources list); the repo keeps them
+for n in "$dest"/notes/research/*.md; do
+  "$repo/scripts/strip_sources" "$n" < /dev/null || { echo "can't strip the sources from $n" >&2; exit 1; }
+done
+
+if git -C "$repo" cat-file -e "$branch:notes/reference-library/manifest.json" 2>/dev/null; then
+  library=()
+  case "$profile" in every|blank) library=(--without-subjects) ;; esac
+  "$repo/scripts/build_reference_library" --ref "$branch" ${library[@]+"${library[@]}"} "$dest/notes/reference-library.json"
+fi
+
+# The guide's tube table comes from the configured runtime.
+guide=$dest/notes/easel_guide.md
+table_head='| tube | pigment | hiding | stiffness | tinting strength | drying |'
+[ "$(grep -cxF "$table_head" "$guide")" = 1 ] || { echo "the guide has no tube table (or more than one)" >&2; exit 1; }
+table=$(cd / && "$dest/bin/easel" tubes --markdown) || { echo "the exported easel can't name its box" >&2; exit 1; }
+[ "$(head -1 <<<"$table")" = "$table_head" ] || { echo "the exported easel's tube table has another header" >&2; exit 1; }
+TABLE=$table awk -v head="$table_head" '
+  $0 == head { print ENVIRON["TABLE"]; skip = 1; next }
+  skip && /^\|/ { next }
+  { skip = 0; print }
+' "$guide" > "$guide.part"
+mv "$guide.part" "$guide"
+shown=$(awk -v head="$table_head" '$0 == head { on = 1 } on && !/^\|/ { exit } on { print }' "$guide")
+[ "$shown" = "$table" ] || { echo "the guide's tube table isn't the easel's box" >&2; exit 1; }
+if [ -z "$box" ] && ! git -C "$repo" show "$branch:notes/easel_guide.md" | cmp -s - "$guide"; then
+  echo "the $profile studio's guide differs from the committed guide" >&2
+  exit 1
+fi
+
+# nothing but those
+extra=$(cd "$dest" && find . -type f ! -path ./bin/easel ! -path ./bin/studio ! -path ./bin/box ! -path ./bin/width ! -path ./bin/THIRD_PARTY_NOTICES.md ! -path './notes/*' | sort)
+[ -z "$extra" ] || { echo "unexpected files in $dest:" >&2; echo "$extra" >&2; exit 1; }
+
+# names of painters: none anywhere a painter can read in the blank studio
+# (bin/THIRD_PARTY_NOTICES.md, the legal notices, aside); in an artist's
+# studio only that artist's
+"$repo/scripts/check_studio_names" "$dest" ${own[@]+"${own[@]}"} || { echo "the $profile studio names painters it shouldn't" >&2; exit 1; }
+
+# the tubes in the guide: no tube names outside the studio's box
+catalog=$(git -C "$repo" show "$branch:crates/paint/src/palette.rs" | sed -n 's/^ *tube("\([^"]*\)".*/\1/p')
+[ "$(wc -l <<<"$catalog")" -ge 14 ] || { echo "can't read the tube catalog from palette.rs" >&2; exit 1; }
+# an outside tube's name counts unless it lies inside one of the box's own
+# records (vermilion in orange vermilion, Prussian blue in Antwerp blue's
+# pigment); an outside name that holds an inside one (orange vermilion in a
+# box with vermilion) counts (scripts/check_box_tubes)
+stray=()
+if ! outside=$("$repo/scripts/check_box_tubes" <(printf '%s\n' "$table") <(printf '%s\n' "$table") <(printf '%s\n' "$catalog")); then
+  [ -n "$outside" ] || { echo "can't check the tubes in the table" >&2; exit 1; }
+  while IFS= read -r t; do [ -z "$t" ] || stray+=("$t"); done <<<"$outside"
+fi
+if [ ${#stray[@]} -gt 0 ]; then
+  echo "the tube table of the $profile studio names tubes outside its box: $(printf '"%s" ' "${stray[@]}")" >&2
+  exit 1
+fi
+
+# the binary runs with no source present: a short session in a throwaway
+# copy of the studio, from another directory
+probe_parent=${TMPDIR:-$repo/target}
+mkdir -p "$probe_parent"
+probe=$(mktemp -d "$probe_parent/studio-probe.XXXXXX")
+trap 'rm -rf -- "$probe"' EXIT
+cp -R "$dest/." "$probe/"
+E="$probe/bin/easel"
+(
+  cd /
+  "$E" open >/dev/null
+  trap '"$E" close >/dev/null 2>&1 || true' EXIT
+  # the first and the last tube in the studio's box
+  "$E" "do" 'local t = tubes(); canvas{size=300, aspect=1.25, linen=15, ground={{pile={{t[1], 1}}, um=80, apply="knife"}}}' >/dev/null
+  "$E" "do" 'local t = tubes(); b = brush("round", 4); b:load(pile{{t[#t], 1}}, 0.8); b:stroke({{200, 300}, {800, 320}})' >/dev/null
+  "$E" look >/dev/null
+  "$E" save >/dev/null
+  "$E" close >/dev/null
+  trap - EXIT
+)
+[[ -s "$probe/paintings/lua/painting.lua" && -s "$probe/out/easel/painting/painting.png" ]] || { echo "the exported easel didn't paint in $probe" >&2; exit 1; }
+# its log names the studio's box (the default box: no line)
+logged=$(sed -n '/^--@ chunk/q; s/^--@ box //p' "$probe/paintings/lua/painting.lua")
+[ "$logged" = "$box" ] || { echo "the probe's log names box '$logged', not '$box'" >&2; exit 1; }
+# and the width asked for (2400: no line): an easel built from a revision that doesn't read
+# bin/width paints at 2400 whatever STUDIO_WIDTH says
+logged_width=$(sed -n '/^--@ chunk/q; s/^--@ width //p' "$probe/paintings/lua/painting.lua")
+[ "${logged_width:-2400}" = "${width:-2400}" ] || { echo "the probe painted at ${logged_width:-2400} px, not the ${width:-2400} px STUDIO_WIDTH asks for: the easel built from $branch doesn't read bin/width" >&2; exit 1; }
+# developer commands (run, check, finish, render-checkpoint) work in the studio for the scripts, but its help leaves them out
+# (output captured first: under pipefail, `"$E" help | grep` fails with the command it tests)
+help_text=$("$E" help 2>&1 || true)
+if [[ $help_text == *'easel check'* || $help_text == *'easel run'* ]]; then
+  echo "the exported easel's help lists developer commands" >&2
+  exit 1
+fi
+
+echo "exported the $profile studio from $branch ($sha) to $dest"
+echo "  easel: $dest/bin/easel (checked)"
+echo "  notices: $dest/bin/THIRD_PARTY_NOTICES.md"
+echo "  box: ${box:-the default tube box}"
+echo "  notes: $(cd "$dest/notes" && find . -type f | sed 's|^\./||' | sort | tr '\n' ' ')"

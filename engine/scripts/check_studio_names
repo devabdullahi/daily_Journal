@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Painters' names in an exported studio: none anywhere a painter can read
+# (notes/ and bin/box; bin/THIRD_PARTY_NOTICES.md, the legal
+# notices, aside) but the studio's own artist's.
+#
+#   scripts/check_studio_names <studio> [own name ...]
+#
+# Names match case-insensitively as whole words; a name's space or hyphen
+# matches a space, a hyphen or nothing ("Alma-Tadema", "Alma Tadema",
+# "da Vinci", "da-Vinci", "DaVinci"). The notes and bin/box are read as
+# UTF-8 text. Binaries are not scanned. Exits 1 and
+# lists the hits if there are any.
+# (scripts/export_r16_studio runs it; scripts/tests/studio_names.sh tests it.)
+set -euo pipefail
+[ $# -ge 1 ] || { echo "usage: $0 <studio> [own name ...]" >&2; exit 2; }
+dest=$1
+shift
+
+# each a pattern: [..] a letter's spellings, a space or a hyphen any joining
+artists=(Friedrich Turner 'C[eé]zanne' Rembrandt Vermeer Renoir Pissarro Sisley Morisot Seurat 'Van Gogh' Eckersberg Carus Kersting Constable Monet Manet Bruegel Brueghel Hockney Ruisdael Hobbema Cuyp Lorrain Poussin Corot Titian Tiziano Rubens 'Vel[aá]zquez' Goya Leonardo 'da Vinci' Vinci Michelangelo Raphael Ingres Delacroix Boucher Troyon Oudry Desportes Dahl Blechen Runge Oehme Kobell Gainsborough Whistler Sargent Degas Hopper Munch Picasso Matisse Kandinsky 'Bob Ross' Winsor Inness Alma-Tadema Tadema Tonn)
+ARTISTS=$(printf '%s\n' "${artists[@]}") OWN=$(printf '%s\n' ${@+"$@"}) perl -e '
+  use strict; use warnings;
+  use Encode qw(decode FB_DEFAULT);
+  use File::Find;
+  binmode STDERR, ":encoding(UTF-8)";
+  my $dest = shift;
+  my @env = map { [grep { length } split /\n/, decode("UTF-8", $ENV{$_} // "")] } qw(ARTISTS OWN);
+  my ($artists, $own) = @env;
+  # a name as a pattern: its spaces and hyphens match a space, a hyphen or nothing
+  my $pat = sub { join "[- ]?", split /[- ]/, $_[0] };
+  # the own names of the studio: an artist as the list spells it, or a name its pattern
+  # matches ("Cézanne" for "C[eé]zanne"), so a caller does not copy the patterns
+  my @others = grep { my $a = $_; my $p = $pat->($a); !grep { $_ eq $a || /^(?:$p)$/i } @$own } @$artists;
+  my $words = join "|", map { $pat->($_) } @others;
+  my $read = sub { open my $f, "<:raw", $_[0] or die "check_studio_names: $_[0]: $!\n"; local $/; my $b = <$f>; decode("UTF-8", $b, FB_DEFAULT) };
+  my @hits;
+  # the notes and bin/box: text (files with a NUL byte are skipped, as grep -I would)
+  my @texts;
+  find({ no_chdir => 1, wanted => sub { push @texts, $_ if -f } }, "$dest/notes") if -d "$dest/notes";
+  push @texts, "$dest/bin/box" if -f "$dest/bin/box";
+  for my $p (sort @texts) {
+    my $t = $read->($p);
+    next if $t =~ /\0/;
+    my $n = 0;
+    (my $rel = $p) =~ s/^\Q$dest\E\/?//;
+    for my $line (split /\n/, $t) { $n++; push @hits, "$rel:$n:$line" if $line =~ /\b(?:$words)\b/i }
+  }
+  if (@hits) {
+    print STDERR "painters\x27 names in $dest:\n", map { "$_\n" } @hits;
+    exit 1;
+  }
+' "$dest"

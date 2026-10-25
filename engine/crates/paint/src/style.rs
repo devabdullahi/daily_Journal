@@ -1,0 +1,606 @@
+//! Style profiles: a support and ground, a tool kit, a palette and
+//! handling presets.
+//!
+//! A `Style` is data: linen, ground layers, five tools (`broad`, `body`,
+//! `detail`, `line`, `blender`), a palette, medium fractions and blending
+//! settings. Paintings ask the style for a `Handling` and supply geometry
+//! and paint, using `Handling::piled` for explicit tube mixtures. Presets
+//! do not choose recipes or match colors.
+//!
+//! The handling presets (`broad`, `body`, `detail`, `hatch`, `glaze`,
+//! `blend`) choose stroke lengths, paths, pressure variation, placement and
+//! order. Their fields are public and are listed in each preset below;
+//! every one can be changed with the `Handling` builder methods, for
+//! example stroke direction (`angle`), crossing (`cross`), bow (`curve`),
+//! wander (`drift`) and the order an area is worked in (`order`, `sweep`).
+
+use crate::bristle::{Orient, Tool};
+use crate::canvas::Canvas;
+use crate::color::{Rgb, hex};
+use crate::handling::Handling;
+use crate::mask::Mask;
+use crate::palette::Palette;
+use crate::surface::Linen;
+use rayon::prelude::*;
+
+/// Mean thickness (µm) a brushed ground (`brush_ground`) lays for a load of
+/// the priming brush: about `BRUSHED_UM_AT_FULL * load^BRUSHED_EXP`
+/// (measured: load 0.160 lays 37.8 µm, 0.279 lays 73.7, 0.386 lays 111.3;
+/// a fuller brush leaves fewer gaps for the filling dabs to close, and
+/// laying off takes a thin film along with it, so the thickness grows a
+/// little faster than the load).
+const BRUSHED_UM_AT_FULL: f32 = 364.0;
+const BRUSHED_EXP: f32 = 1.24;
+
+/// How a ground layer is put on.
+#[derive(Clone, Copy, Debug)]
+pub enum Apply {
+    /// Spread with a priming knife: levels the weave; `texture` 0..1 is the
+    /// waviness of the knife.
+    Knife { texture: f32 },
+    /// Rolled on: a fine, even orange-peel texture.
+    Roller,
+    /// Brushed with a broad hog brush: spread in crossing strokes whose
+    /// direction drifts over the canvas, then laid off with light passes of
+    /// the clean brush; fine, broken bristle striations stay (see
+    /// `brush_ground`).
+    Brush,
+}
+
+/// One preparation layer.
+#[derive(Clone, Debug)]
+pub struct Ground {
+    pub color: Rgb,
+    pub hiding: f32,
+    /// The retained tube paint for engine-9 film optics, if supplied.
+    pub paint: Option<crate::Paint>,
+    /// Thickness, µm.
+    pub um: f32,
+    /// Stiffness of the priming paste (0 fluid .. 1 stiff).
+    pub stiff: f32,
+    pub apply: Apply,
+    /// How absorbent the layer is, 0 (an oil ground) to 1 (a chalk and glue
+    /// ground that draws oil out of the paint laid on it: matte, quick to
+    /// set; engine 4). Only the top layer's matters.
+    pub absorbent: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct Style {
+    pub name: &'static str,
+    /// Physical width of a typical canvas, mm.
+    pub width_mm: f32,
+    pub linen: Linen,
+    /// Color of the raw linen.
+    pub raw: Rgb,
+    /// Preparation layers, bottom first.
+    pub ground: Vec<Ground>,
+    /// Tool for large areas of thin paint (`broad`).
+    pub broad: Tool,
+    /// Tool for body color (`body`).
+    pub body: Tool,
+    /// Tool for small marks and edges (`detail`, `hatch`).
+    pub detail: Tool,
+    /// Tool for lines (`line_tool`).
+    pub line: Tool,
+    /// Tool for softening wet passages (`blend`; None: no blender).
+    pub blender: Option<Tool>,
+    /// Blending passes over broad areas.
+    pub blend_passes: usize,
+    /// Pressure used when blending (light = gentle fusing).
+    pub blend_pressure: f32,
+    /// Tube paints available for explicitly knifed piles.
+    pub palette: Palette,
+    /// Suggested oil medium fractions for explicit body and thin piles.
+    /// Pass the chosen fraction to `Handling::piled`.
+    pub body_medium: f32,
+    pub thin_medium: f32,
+    /// How unevenly each pile is mixed (relative sd of proportions).
+    pub mix_jitter: f32,
+    /// Surface relief and gloss for the final lighting.
+    pub relief: (f32, f32),
+}
+
+impl Style {
+    /// A small oil painting's materials.
+    ///
+    /// - Plain linen, 15 × 13 threads/cm, 440 mm wide.
+    /// - Ground: two knifed layers (110 µm and 70 µm) that level the
+    ///   weave, then a brushed top layer (60 µm) whose striations stay;
+    ///   total 240 µm.
+    /// - `Palette::cobalt_box`.
+    pub fn oil() -> Self {
+        Style::oil_with(Palette::cobalt_box())
+    }
+
+    /// `oil` with another palette (the easel's canvas{}: the painting's box).
+    /// The older boxes aren't built for it, so a build that paints only from
+    /// its box (the easel) holds none of their names.
+    pub fn oil_with(palette: Palette) -> Self {
+        Style {
+            name: "oil",
+            width_mm: 440.0,
+            linen: Linen { warp_per_cm: 15.0, weft_per_cm: 13.0, ..Linen::fine(1) },
+            raw: hex("#a8966f"),
+            ground: vec![
+                Ground { paint: None, color: hex("#9a5a36"), hiding: 0.8, um: 110.0, stiff: 0.25, apply: Apply::Knife { texture: 0.35 }, absorbent: 0.0 },
+                Ground { paint: None, color: hex("#b08457"), hiding: 0.8, um: 70.0, stiff: 0.3, apply: Apply::Knife { texture: 0.3 }, absorbent: 0.0 },
+                Ground { paint: None, color: hex("#a9785a"), hiding: 0.8, um: 60.0, stiff: 0.35, apply: Apply::Brush, absorbent: 0.0 },
+            ],
+            broad: Tool { lay: 0.55, push: 0.03, ragged: 0.4, ..Tool::filbert(22.0) },
+            body: Tool { lay: 0.7, push: 0.06, ..Tool::filbert(9.0) },
+            detail: Tool::round_sable(2.2),
+            line: Tool::rigger(0.6),
+            blender: Some(Tool { pickup: 0.15, run: 45.0, ..Tool::badger(40.0) }),
+            blend_passes: 3,
+            blend_pressure: 0.5,
+            palette,
+            body_medium: 0.2,
+            thin_medium: 0.45,
+            mix_jitter: 0.06,
+            relief: (0.06, 0.006),
+        }
+    }
+
+    /// `oil` on a 1714 mm canvas of 12 × 11 threads/cm linen, with
+    /// `Palette::smalt_box` and a three-layer ground: bright red, then two
+    /// light brown layers, the first two knifed, the third rolled on (a fine
+    /// texture).
+    pub fn oil_red_ground() -> Self {
+        Style {
+            width_mm: 1714.0,
+            linen: Linen { warp_per_cm: 12.0, weft_per_cm: 11.0, ..Linen::fine(1) },
+            ground: vec![
+                Ground { paint: None, color: hex("#b0583a"), hiding: 0.85, um: 110.0, stiff: 0.25, apply: Apply::Knife { texture: 0.35 }, absorbent: 0.0 },
+                Ground { paint: None, color: hex("#c9ad8a"), hiding: 0.8, um: 70.0, stiff: 0.3, apply: Apply::Knife { texture: 0.3 }, absorbent: 0.0 },
+                Ground { paint: None, color: hex("#d8c7ab"), hiding: 0.8, um: 30.0, stiff: 0.5, apply: Apply::Roller, absorbent: 0.0 },
+            ],
+            palette: Palette::smalt_box(),
+            ..Self::oil()
+        }
+    }
+
+    /// A primed canvas: this style's linen and physical width (`width_mm`),
+    /// with the ground layers applied bottom first.
+    pub fn prepare(&self, width_px: usize, aspect: f32, seed: u64) -> Canvas {
+        self.prepare_on(Canvas::new(width_px, aspect, self.raw), seed)
+    }
+
+    /// `prepare`, holding only the window `crop` (a crop render), whatever
+    /// `set_crop` says.
+    pub fn prepare_window(&self, width_px: usize, aspect: f32, seed: u64, crop: Option<crate::canvas::Crop>) -> Canvas {
+        self.prepare_on(Canvas::new_window(width_px, aspect, self.raw, crop), seed)
+    }
+
+    fn prepare_on(&self, c: Canvas, seed: u64) -> Canvas {
+        self.prepare_cached_on(c, seed, None)
+    }
+
+    pub fn prepare_cached(&self, width_px: usize, aspect: f32, seed: u64, directory: &std::path::Path, build: &str) -> Canvas {
+        self.prepare_cached_on(Canvas::new(width_px, aspect, self.raw), seed, Some((directory, build)))
+    }
+
+    fn prepare_cached_on(&self, c: Canvas, seed: u64, cache: Option<(&std::path::Path, &str)>) -> Canvas {
+        use sha2::{Digest, Sha256};
+        let c = c
+            .with_engine(self.palette.engine)
+            .with_adaptive_sweep(self.palette.adaptive_sweep)
+            .with_size_mm(self.width_mm)
+            .with_linen(Linen { seed, ..self.linen });
+        let cache = cache.filter(|_| self.ground.iter().any(|g| g.um > 0.0 && matches!(g.apply, Apply::Brush))).map(|(dir, build)| {
+            let mut key = Sha256::new();
+            key.update(b"prepared ground 1\0");
+            key.update(build.as_bytes());
+            key.update(self.palette.name.as_bytes());
+            for n in [c.f.w, c.f.h, c.f.x0, c.f.y0, c.f.full_w, c.f.full_h, c.keep.0, c.keep.1, c.keep.2, c.keep.3] {
+                key.update((n as u64).to_le_bytes());
+            }
+            key.update(seed.to_le_bytes());
+            key.update(c.engine.to_le_bytes());
+            key.update(c.engine.min(3).to_le_bytes());
+            if c.adaptive_sweep {
+                key.update(b"adaptive-sweep");
+            }
+            for f in [c.f.scale, c.mm_per_unit, self.raw[0], self.raw[1], self.raw[2], self.linen.warp_per_cm, self.linen.weft_per_cm, self.linen.crown_um, self.linen.slubs] {
+                key.update(f.to_bits().to_le_bytes());
+            }
+            key.update((self.ground.len() as u64).to_le_bytes());
+            for g in &self.ground {
+                for f in [g.color[0], g.color[1], g.color[2], g.hiding, g.um, g.stiff, g.absorbent] {
+                    key.update(f.to_bits().to_le_bytes());
+                }
+                if c.engine >= crate::PIGMENT_MIXER {
+                    key.update([g.paint.is_some() as u8]);
+                    if let Some(paint) = &g.paint {
+                        key.update([paint.spectral_films as u8]);
+                        key.update(paint.scatter.to_bits().to_le_bytes());
+                        key.update(paint.stiff.to_bits().to_le_bytes());
+                        for f in paint.latent().color {
+                            key.update(f.to_bits().to_le_bytes());
+                        }
+                    }
+                }
+                let (kind, texture) = match g.apply { Apply::Knife { texture } => (0u8, texture), Apply::Roller => (1, 0.0), Apply::Brush => (2, 0.0) };
+                key.update([kind]);
+                key.update(texture.to_bits().to_le_bytes());
+            }
+            let key = format!("{:x}", key.finalize());
+            (dir.join(build).join(format!("{key}.ckpt")), key)
+        });
+        if let Some((path, key)) = &cache {
+            if let Ok(bytes) = std::fs::read(path) {
+                if bytes.len() >= 32 && Sha256::digest(&bytes[32..]).as_slice() == &bytes[..32] {
+                    if let Ok((cached, header)) = Canvas::read_state(&mut &bytes[32..]) {
+                        if header == *key {
+                            // (written with the drain switch on to keep the
+                            // paint's packing, below; prepared, it is off)
+                            return cached.with_drain(false).with_quarter_tiles(self.palette.quarter_tiles).with_glaze_film(self.palette.glaze_film).with_liquid_film_levels(self.palette.liquid_film_levels).with_sealed_drawing_guide(self.palette.sealed_drawing_guide).with_drawing_optics(self.palette.drawing_optics).with_rag_lift(self.palette.rag_lift).with_knife_skim(self.palette.knife_skim).with_blend_feather(self.palette.blend_feather).with_brush_skim(self.palette.brush_skim).with_material(self.palette.material);
+                        }
+                    }
+                }
+            }
+        }
+        let mut c = self.ground_on(c, seed);
+        if let Some((path, key)) = cache {
+            // the cache keeps the paint's packing (`wet::Prop`'s last five),
+            // which only a draining canvas's checkpoint holds (version 14), so
+            // a ground read back is the ground just prepared, bit for bit (the
+            // caller sets the drain switch on either)
+            let mut bytes = Vec::new();
+            c.drain = c.engine >= 4;
+            let written = c.write_state(&mut bytes, &key).is_ok();
+            c.drain = false;
+            if written {
+                use std::io::Write;
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let temp = path.with_extension(format!("{}-{}.tmp", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+                let saved = (|| -> std::io::Result<()> {
+                    std::fs::create_dir_all(path.parent().unwrap())?;
+                    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
+                    file.write_all(&Sha256::digest(&bytes))?;
+                    file.write_all(&bytes)?;
+                    drop(file);
+                    std::fs::rename(&temp, &path)
+                })();
+                if saved.is_err() { let _ = std::fs::remove_file(temp); }
+            }
+        }
+        c.with_quarter_tiles(self.palette.quarter_tiles).with_glaze_film(self.palette.glaze_film).with_liquid_film_levels(self.palette.liquid_film_levels).with_sealed_drawing_guide(self.palette.sealed_drawing_guide).with_drawing_optics(self.palette.drawing_optics).with_rag_lift(self.palette.rag_lift).with_knife_skim(self.palette.knife_skim).with_blend_feather(self.palette.blend_feather).with_brush_skim(self.palette.brush_skim).with_material(self.palette.material)
+    }
+
+    /// A sheet of paper of this style's width, with its ground layers (if
+    /// any) laid on it. Never from the ground cache (`prepare_cached`),
+    /// whose key describes a linen support: a sheet is laid afresh.
+    pub fn prepare_paper(&self, width_px: usize, aspect: f32, seed: u64, paper: crate::paper::Paper) -> Canvas {
+        let c = Canvas::new(width_px, aspect, self.raw).with_engine(self.palette.engine).with_adaptive_sweep(self.palette.adaptive_sweep).with_size_mm(self.width_mm).with_paper(paper);
+        self.ground_on(c, seed).with_quarter_tiles(self.palette.quarter_tiles).with_glaze_film(self.palette.glaze_film).with_liquid_film_levels(self.palette.liquid_film_levels).with_sealed_drawing_guide(self.palette.sealed_drawing_guide).with_drawing_optics(self.palette.drawing_optics).with_rag_lift(self.palette.rag_lift).with_knife_skim(self.palette.knife_skim).with_blend_feather(self.palette.blend_feather).with_brush_skim(self.palette.brush_skim).with_material(self.palette.material)
+    }
+
+    /// This style's ground layers laid on `c`, bottom first.
+    fn ground_on(&self, mut c: Canvas, seed: u64) -> Canvas {
+        // the canvas is prepared alike in every engine: engine 4's stiffer
+        // films and clumping hair are the painting's, not the primer's
+        let engine = c.engine;
+        c.engine = if engine >= crate::PIGMENT_MIXER { engine } else { engine.min(3) };
+        for (k, g) in self.ground.iter().enumerate() {
+            if g.um <= 0.0 {
+                continue;
+            }
+            let s = seed * 31 + k as u64;
+            match g.apply {
+                Apply::Knife { .. } | Apply::Roller => {
+                    let texture = match g.apply { Apply::Knife { texture } => texture, _ => 0.8 };
+                    match &g.paint {
+                        Some(paint) if engine >= crate::PIGMENT_MIXER && paint.spectral_films => c.prime_paint(paint, g.um, texture, s),
+                        _ => c.prime(g.color, g.hiding, g.um, g.stiff, texture, s),
+                    }
+                }
+                Apply::Brush => {
+                    let before = g.paint.as_ref().filter(|p| engine >= crate::PIGMENT_MIXER && p.spectral_films).map(|_| (c.px.clone(), c.film.clone()));
+                    c.engine = engine.min(3);
+                    brush_ground(&mut c, g, s);
+                    c.engine = if engine >= crate::PIGMENT_MIXER { engine } else { engine.min(3) };
+                    if let Some((px, film)) = before {
+                        let paint = g.paint.as_ref().unwrap();
+                        c.px.par_iter_mut().zip(&c.film).zip(px).zip(film).for_each(|(((p, &f), under), f0)| *p = paint.over(under, f - f0));
+                    }
+                    // (`prime` counts its own layers)
+                    c.ground_um += g.um;
+                }
+            }
+            c.ground_finish(g.absorbent);
+        }
+        c.engine = engine;
+        c
+    }
+}
+
+#[cfg(test)]
+mod ground_optics_tests {
+    use super::*;
+
+    #[test]
+    fn cached_grounds_track_retained_paint_stiffness_only_from_engine_9() {
+        let directory = std::env::temp_dir().join(format!("paint-ground-stiffness-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let mut palette = Palette::new("ground stiffness", crate::palette::catalog());
+        palette.engine = crate::PIGMENT_MIXER;
+        palette.glaze_film = true;
+        let i = palette.tubes.iter().position(|t| t.name == "lead white").unwrap();
+        let pile = palette.pile(vec![(i, 1.0)]);
+        let paint = pile.paint(0.0);
+        assert!(paint.spectral_films);
+        for engine in [9, 1, 2, 3, 4, 5, 7, 8] {
+            for (kind, apply) in [("knife", Apply::Knife { texture: 0.8 }), ("roller", Apply::Roller)] {
+                let cache = directory.join(format!("{engine}-{kind}"));
+                let mut style = Style::oil_with(palette.clone());
+                style.palette.engine = engine;
+                style.width_mm = 3.0;
+                style.ground = vec![
+                    Ground { color: pile.color, hiding: pile.hiding, paint: Some(paint.clone().with_stiff(0.0)), stiff: pile.stiff, um: 80.0, apply, absorbent: 0.0 },
+                    Ground { color: pile.color, hiding: pile.hiding, paint: None, stiff: pile.stiff, um: 5.0, apply: Apply::Brush, absorbent: 0.0 },
+                ];
+                let soft = style.prepare_cached(8, 1.0, 7, &cache, "test");
+                assert_eq!(std::fs::read_dir(cache.join("test")).unwrap().count(), 1);
+                let hit = style.prepare_cached(8, 1.0, 7, &cache, "test");
+                assert_eq!(hit.surface_um(), soft.surface_um());
+                assert_eq!(hit.pixels(), soft.pixels());
+                style.ground[0].paint = Some(paint.clone().with_stiff(1.0));
+                let fresh = style.prepare(8, 1.0, 7);
+                if engine >= crate::PIGMENT_MIXER {
+                    assert_ne!(fresh.surface_um(), soft.surface_um(), "{engine} {kind}: stiffness must change the relief");
+                } else {
+                    assert_eq!(fresh.surface_um(), soft.surface_um());
+                    assert_eq!(fresh.pixels(), soft.pixels());
+                }
+                let cached = style.prepare_cached(8, 1.0, 7, &cache, "test");
+                assert_eq!(cached.surface_um(), fresh.surface_um(), "{engine} {kind}: cached relief must match fresh preparation");
+                assert_eq!(cached.pixels(), fresh.pixels());
+                assert_eq!(std::fs::read_dir(cache.join("test")).unwrap().count(), if engine >= crate::PIGMENT_MIXER { 2 } else { 1 });
+            }
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn grounds_keep_the_same_paint_thickness_and_backing_optics() {
+        let data = include_str!("../../../scripts/pigment_data/revigo/revigo-aggregated-palette-spectral-data.txt");
+        let sample = |id: &str| {
+            let row = data.lines().find(|l| l.split('\t').next() == Some(id)).unwrap();
+            let values: Vec<f32> = row.split('\t').skip(1).map(|v| v.parse::<f32>().unwrap() / 100.0).collect();
+            crate::spectral::to_rgb(&std::array::from_fn(|w: usize| values[w.saturating_sub(2).min(30)] - 0.04)).map(|v| v.clamp(0.0, 1.0))
+        };
+        let mut palette = Palette::new("ground optics", crate::palette::catalog());
+        palette.engine = crate::PIGMENT_MIXER;
+        palette.glaze_film = true;
+        for (name, backing) in [("Prussian blue", "13A_w"), ("lead white", "08A_b")] {
+            let i = palette.tubes.iter().position(|t| t.name == name).unwrap();
+            let pile = palette.pile(vec![(i, 1.0)]);
+            let paint = pile.paint(0.0);
+            let under = sample(backing);
+            for um in [5.0, 25.0, 100.0, 400.0] {
+                let mut direct = Canvas::new(8, 1.0, under).with_engine(crate::PIGMENT_MIXER);
+                direct.prime_paint(&paint, um, 0.0, 7);
+                for &pixel in direct.pixels() {
+                    let expected = paint.over(under, um / crate::COAT_UM);
+                    assert!((0..3).all(|k| (pixel[k] - expected[k]).abs() < 2e-6), "{name}, {um} µm: {pixel:?} != {expected:?}");
+                }
+                if name == "lead white" && um == 100.0 {
+                    let actual = crate::color::to_oklab(direct.pixels()[32]);
+                    let measured = crate::color::to_oklab(sample("08A_ob"));
+                    let error = (0..3).map(|k| (actual[k] - measured[k]).powi(2)).sum::<f32>().sqrt();
+                    assert!(error < 0.0061, "lead white measured-film error: {error}");
+                }
+                for apply in [Apply::Knife { texture: 0.0 }, Apply::Roller, Apply::Brush] {
+                    let mut style = Style::oil_with(palette.clone());
+                    style.ground = vec![Ground { color: pile.color, hiding: pile.hiding, paint: Some(paint.clone()), stiff: pile.stiff, um, apply, absorbent: 0.0 }];
+                    let canvas = style.prepare_on(Canvas::new(8, 1.0, under), 7);
+                    for (i, &pixel) in canvas.pixels().iter().enumerate() {
+                        let expected = paint.over(under, canvas.film[i]);
+                        assert!((0..3).all(|k| (pixel[k] - expected[k]).abs() < 2e-6), "{name}, {um} µm, {apply:?}, pixel {i}: {pixel:?} != {expected:?}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A brushed top ground: the paste is first spread with a broad hog brush
+/// in crossing strokes whose direction wanders over the canvas, then laid
+/// off while wet with light passes of the unloaded brush held low, which
+/// skim rather than plough, level the spreading's stroke edges and leave
+/// only fine, broken bristle striations.
+fn brush_ground(c: &mut Canvas, g: &Ground, s: u64) {
+    let all = Mask::from_fn(c.frame(), |_, _| 1.0);
+    let hog = Tool { lay: 1.2, ragged: 0.2, ..Tool::hog_flat(40.0) };
+    let col = g.color;
+    // the stroke direction drifts over the canvas, patch by patch (~90
+    // units = 40 mm; up to ±0.7 rad, horizontal on average)
+    let turn = move |x: f32, y: f32| 1.4 * (crate::surface::vnoise(x / 90.0, y / 90.0, s ^ 0x9e37) - 0.5);
+    // the paste is pushed a little ahead of the bristles, not ploughed
+    // into ridges (with a hog's own push, 0.3, it piles 2x as thick at the
+    // stroke edges: tall, sharp crests that thin paint drains off)
+    let spread = Handling::new(Tool { push: 0.15, ..hog.clone() })
+        .color(move |_, _| col)
+        .paint(g.hiding, g.stiff)
+        .angle(turn)
+        .angle_jitter(0.15)
+        .cross(0.5)
+        .curve(0.04, 0.3)
+        .drift(0.25, 300.0)
+        .tail(0.1)
+        .broken(0.1)
+        .swell(0.12)
+        .length(100.0, 250.0)
+        .coverage(3.5)
+        .fill(true)
+        .pressure(0.8, 0.95)
+        .dips(1, (g.um / BRUSHED_UM_AT_FULL).powf(1.0 / BRUSHED_EXP).min(1.0), 0.3)
+        .jitter(0.004, 0.002)
+        .shake(0.15);
+    c.work(&all, &spread, s);
+    // laying off: the clean brush drawn lightly through the wet paste, held
+    // low so it skims the paste and barely pushes it
+    let lay_off = Handling::new(Tool { push: 0.03, ..hog })
+        .blender()
+        .angle(turn)
+        .angle_jitter(0.12)
+        .cross(0.15)
+        .curve(0.06, 0.4)
+        .drift(0.3, 250.0)
+        .tail(0.2)
+        .broken(0.3)
+        .swell(0.25)
+        .length(120.0, 380.0)
+        .coverage(3.5)
+        .pressure(0.35, 0.55)
+        .dips(2, 0.0, 0.8)
+        .shake(0.3);
+    c.work(&all, &lay_off, s + 7);
+    c.dry();
+}
+
+impl Style {
+    /// The broad tool: strokes 80–220 units
+    /// long that bow into long arcs (`curve`) and whose direction wanders
+    /// over 350-unit patches (`drift`). Set the direction with `angle`; the
+    /// default is horizontal.
+    pub fn broad(&self) -> Handling<'_> {
+        Handling::new(self.broad.clone())
+            .length(80.0, 220.0)
+            .coverage(2.5)
+            .mix_jitter(self.mix_jitter)
+            .pressure(0.55, 0.8)
+            .dips(2, 0.4, 0.5)
+            .angle_jitter(0.06)
+            .curve(0.06, 0.25)
+            .drift(0.22, 350.0)
+            .tail(0.15)
+            .broken(0.08)
+            .swell(0.18)
+            .ramps(0.12, 0.4)
+    }
+
+    /// The body tool: strokes 20–60 units
+    /// long, more bowed and broken than `broad`, the direction wandering
+    /// over 150-unit patches. Set the direction with `angle`.
+    pub fn body(&self) -> Handling<'_> {
+        Handling::new(self.body.clone())
+            .length(20.0, 60.0)
+            .coverage(2.5)
+            .mix_jitter(self.mix_jitter * 1.4)
+            .pressure(0.6, 0.9)
+            .dips(2, 0.56, 0.6)
+            .angle_jitter(0.12)
+            .curve(0.08, 0.3)
+            .drift(0.3, 150.0)
+            .tail(0.15)
+            .broken(0.1)
+            .swell(0.22)
+    }
+
+    /// The detail tool: strokes 4–14 units long, clipped to the mask (`clip`).
+    pub fn detail(&self) -> Handling<'_> {
+        Handling::new(self.detail.clone())
+            .length(4.0, 14.0)
+            .coverage(3.0)
+            .mix_jitter(self.mix_jitter)
+            .pressure(0.7, 0.95)
+            .dips(3, 0.9 * 0.8, 0.8)
+            .clip(true)
+            .threshold(0.1)
+            .curve(0.04, 0.2)
+            .drift(0.1, 60.0)
+            .tail(0.1)
+            .broken(0.0)
+            .swell(0.2)
+    }
+
+    /// Short hatched strokes side by side: one family of nearly straight
+    /// strokes 5–12 units long, clumped (`clump`), laid area by area. Set
+    /// their direction with `angle`, or `cross` them.
+    pub fn hatch(&self) -> Handling<'_> {
+        Handling::new(Tool { width: self.detail.width * 1.2, ..self.detail.clone() })
+            .length(5.0, 12.0)
+            .coverage(2.5)
+            .mix_jitter(self.mix_jitter)
+            .pressure(0.6, 0.9)
+            .dips(4, 0.7, 0.7)
+            .angle_jitter(0.1)
+            .curve(0.03, 0.1)
+            .drift(0.15, 40.0)
+            .tail(0.08)
+            .broken(0.0)
+            .swell(0.15)
+            .clump(0.5)
+            .ramps(0.05, 0.3)
+    }
+
+    /// A soft brush for a glaze or thin scumble, laid in long strokes.
+    /// Supply an explicit pile with `piled`, choosing its medium there.
+    /// Vary the depth with `load_at`.
+    pub fn glaze(&self) -> Handling<'_> {
+        let soft = Tool { stiffness: 0.3, lay: 0.8, pickup: 0.08, ragged: 0.2, ..Tool::filbert(self.broad.width * 1.2) };
+        Handling::new(soft)
+            .mix_jitter(self.mix_jitter * 0.5)
+            .length(120.0, 300.0)
+            .coverage(2.5)
+            .pressure(0.5, 0.7)
+            .dips(2, 0.35, 0.5)
+            .angle_jitter(0.05)
+            .curve(0.05, 0.25)
+            .drift(0.2, 350.0)
+            .tail(0.12)
+            .broken(0.06)
+            .swell(0.18)
+            .ramps(0.2, 0.4)
+    }
+
+    /// Clean soft blender passes over a wet passage: light crossing strokes
+    /// (± 0.2 rad to `angle`), worked top to bottom so the blender never
+    /// drags paint back up a gradient (change with `order`/`sweep`).
+    ///
+    /// The blender stays inside the region it is given (`clip(true)`, soft
+    /// where the mask is soft). An unclipped blender drags wet paint across
+    /// the mask's edge, where later passages show it in their gaps. To blend
+    /// across an edge, give it a mask that spans the edge, or
+    /// `.clip(false)`.
+    pub fn blend(&self) -> Option<Handling<'_>> {
+        let t = self.blender.clone()?;
+        Some(
+            Handling::new(t)
+                .length(120.0, 300.0)
+                .coverage(3.0)
+                .pressure(self.blend_pressure * 0.8, self.blend_pressure)
+                .dips(3, 0.0, 0.9)
+                .blender()
+                .angle_jitter(0.05)
+                .cross(0.2)
+                .curve(0.06, 0.3)
+                .drift(0.2, 300.0)
+                .broken(0.0)
+                .clip(true)
+                .sweep(std::f32::consts::FRAC_PI_2),
+        )
+    }
+
+    /// A brush held for lines.
+    pub fn line_tool(&self, width: f32) -> Tool {
+        Tool { width, length: width * 5.0, ..self.line.clone() }
+    }
+
+    /// The film (coats) a `glaze` pass lays on a painting with the glaze film
+    /// (`Canvas::with_glaze_film`, `Handling::film`): about 7.5 µm, a
+    /// glaze brushed out thin. Its strength comes from the pile (medium,
+    /// transparent pigment) and from the number of passes.
+    pub const GLAZE_FILM: f32 = 0.3;
+    /// The film (coats) a `scumble` pass lays there: about 5 µm, a broken
+    /// veil that half hides what it crosses in body paint.
+    pub const SCUMBLE_FILM: f32 = 0.2;
+
+    /// Scumbling: the body tool worked back and forth (`scrub(3)`) with
+    /// strokes 10–20 units long, the brush's
+    /// wide axis across its travel (`Orient::Across`).
+    pub fn scumble(&self) -> Handling<'_> {
+        Handling::new(self.body.clone()).scrub(3).length(10.0, 20.0).orient(Orient::Across)
+    }
+}

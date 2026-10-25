@@ -1,0 +1,461 @@
+[
+  {
+    "id": "tree-structure",
+    "title": "Tree structure and species",
+    "source": "notes/round25/runner/trees.md",
+    "sha256": "bca9e508e8b92f056bd6b6e75b282d04b7a7a9abd70033ec36606d41a6f197bb",
+    "lines": [
+      [
+        1,
+        104
+      ]
+    ],
+    "keywords": [
+      "trees",
+      "branches",
+      "branching",
+      "taper",
+      "junctions",
+      "bark",
+      "buds",
+      "alder",
+      "beech",
+      "birch",
+      "lime",
+      "oak",
+      "pine",
+      "spruce",
+      "willow"
+    ],
+    "subject": true
+  },
+  {
+    "id": "rocks",
+    "title": "Rock paint handling: historical observations",
+    "source": "notes/research/courbet_materials.md",
+    "sha256": "74a74ae9fae42767f3d293ccd0dbff25042a6ad358ba43037c98148cbe7a7bf4",
+    "lines": [
+      [
+        257,
+        268
+      ]
+    ],
+    "keywords": [
+      "rocks",
+      "stone",
+      "grotto",
+      "knife",
+      "glaze",
+      "texture"
+    ],
+    "subject": true
+  },
+  {
+    "id": "water",
+    "title": "Water paint handling: historical observations",
+    "source": "notes/research/courbet_materials.md",
+    "sha256": "74a74ae9fae42767f3d293ccd0dbff25042a6ad358ba43037c98148cbe7a7bf4",
+    "lines": [
+      [
+        269,
+        277
+      ]
+    ],
+    "keywords": [
+      "water",
+      "stream",
+      "beach",
+      "wet",
+      "sand",
+      "waves",
+      "scumbling",
+      "glazing",
+      "knife"
+    ],
+    "subject": true
+  },
+  {
+    "id": "snow",
+    "title": "Snow paint handling: historical observations",
+    "source": "notes/research/courbet_materials.md",
+    "sha256": "74a74ae9fae42767f3d293ccd0dbff25042a6ad358ba43037c98148cbe7a7bf4",
+    "lines": [
+      [
+        278,
+        285
+      ]
+    ],
+    "keywords": [
+      "snow",
+      "winter",
+      "knife",
+      "scumble"
+    ],
+    "subject": true
+  },
+  {
+    "id": "artificial-light",
+    "title": "Artificial light: observations and interpretation",
+    "source": "notes/research/hopper_materials.md",
+    "sha256": "f186d4c937b5c9840a5eeb15224f0fe1481f7795a76f45e45231b06ce7fed71c",
+    "lines": [
+      [
+        293,
+        299
+      ],
+      [
+        315,
+        323
+      ]
+    ],
+    "keywords": [
+      "night",
+      "electric",
+      "artificial",
+      "light",
+      "fluorescent",
+      "incandescent",
+      "spill",
+      "occlusion",
+      "falloff",
+      "cast",
+      "shadow"
+    ],
+    "subject": true
+  },
+  {
+    "id": "fruit-cloth",
+    "title": "Fruit and cloth: an examination-backed example",
+    "source": "notes/research/cezanne_materials_full.md",
+    "sha256": "1586af19f8249ac6d51d1064e382238f1aa3f3b588044effad2762c5d843bc70",
+    "lines": [
+      [
+        72,
+        84
+      ]
+    ],
+    "keywords": [
+      "fruit",
+      "apples",
+      "still",
+      "life",
+      "cloth",
+      "reflected",
+      "color",
+      "opaque",
+      "marks",
+      "edges",
+      "passage"
+    ],
+    "subject": true
+  },
+  {
+    "id": "frost",
+    "title": "Snow and frost on branches",
+    "source": "notes/research/trees.md",
+    "sha256": "8f1c9f6e08e9c10403efd6c548757f0f77427c07fa89c60e4b96b1a7828a971c",
+    "lines": [
+      [
+        97,
+        104
+      ]
+    ],
+    "keywords": [
+      "snow",
+      "frost",
+      "hoarfrost",
+      "rime",
+      "ice",
+      "wind",
+      "temperature",
+      "branches"
+    ],
+    "subject": true
+  },
+  {
+    "id": "oil-physics",
+    "title": "Oil paint physics",
+    "source": "notes/research/oil_paint_physics.md",
+    "sha256": "37068c07e5623c903343383dce6bb2433ba936f3090fcb8469d614ec1461d4e8",
+    "lines": [
+      [
+        1,
+        129
+      ]
+    ],
+    "keywords": [
+      "oil",
+      "paint",
+      "rheology",
+      "leveling",
+      "brush",
+      "marks",
+      "impasto",
+      "drying",
+      "wrinkles",
+      "canvas",
+      "weave",
+      "ground"
+    ]
+  },
+  {
+    "id": "watercolor-physics",
+    "title": "Watercolor physics",
+    "source": "notes/research/watercolor_physics.md",
+    "sha256": "7ce770e225d1f3abd4cf528623eae01829ec09f1e1b8794d21cb2e1b8012f25b",
+    "lines": [
+      [
+        1,
+        125
+      ]
+    ],
+    "keywords": [
+      "watercolor",
+      "paper",
+      "sizing",
+      "wetness",
+      "wet-in-wet",
+      "edges",
+      "blooms",
+      "backruns",
+      "granulation",
+      "staining",
+      "lifting",
+      "glazing",
+      "dry",
+      "brush",
+      "salt"
+    ]
+  },
+  {
+    "id": "raw-canvas",
+    "title": "Capillary flow and optics in raw canvas",
+    "source": "notes/research/soak_stain.md",
+    "sha256": "74302c7d9f4e8f7159e85e3d03303dc70771d8ac181ef8fb2524656c092c7d22",
+    "lines": [
+      [
+        36,
+        63
+      ]
+    ],
+    "keywords": [
+      "raw",
+      "canvas",
+      "pouring",
+      "soak-stain",
+      "wicking",
+      "capillary",
+      "anisotropy",
+      "wet",
+      "darkening",
+      "oil",
+      "halos"
+    ]
+  },
+  {
+    "id": "pigments",
+    "title": "Pigment behavior and documented estimates",
+    "source": "notes/research/every_materials.md",
+    "sha256": "51ef68d65f6840e6e1831edc4136e8c9a1140e9f15879072d31e6552f5650bab",
+    "lines": [
+      [
+        31,
+        273
+      ],
+      [
+        281,
+        290
+      ]
+    ],
+    "keywords": [
+      "pigment",
+      "whites",
+      "yellows",
+      "reds",
+      "blues",
+      "greens",
+      "earths",
+      "blacks",
+      "transparency",
+      "tinting",
+      "drying"
+    ]
+  },
+  {
+    "id": "optical-mixing",
+    "title": "Optical mixing and simultaneous contrast",
+    "source": "notes/research/seurat_materials.md",
+    "sha256": "2b1a816e2d62c7eddb977dd70ceeb311f268270f638900cbe409d7058ab17ea8",
+    "lines": [
+      [
+        158,
+        164
+      ]
+    ],
+    "keywords": [
+      "optical",
+      "mixing",
+      "simultaneous",
+      "contrast",
+      "reflected",
+      "color",
+      "complementary",
+      "gray"
+    ]
+  },
+  {
+    "id": "oil-ground",
+    "title": "Oil ground handling at the easel",
+    "source": "notes/techniques.md",
+    "sha256": "cc3b9f6dad29a63db546568c1b5303a1ba0c405ed771e85c8925406e9b03ca31",
+    "lines": [
+      [
+        62,
+        74
+      ]
+    ],
+    "keywords": [
+      "oil",
+      "ground",
+      "absorbency",
+      "toned",
+      "ground"
+    ]
+  },
+  {
+    "id": "oil-spatter",
+    "title": "Oil spatter at the easel",
+    "source": "notes/techniques.md",
+    "sha256": "cc3b9f6dad29a63db546568c1b5303a1ba0c405ed771e85c8925406e9b03ca31",
+    "lines": [
+      [
+        123,
+        133
+      ]
+    ],
+    "keywords": [
+      "spatter",
+      "droplets",
+      "speckles"
+    ]
+  },
+  {
+    "id": "oil-loading",
+    "title": "Uneven paint loading at the easel",
+    "source": "notes/techniques.md",
+    "sha256": "cc3b9f6dad29a63db546568c1b5303a1ba0c405ed771e85c8925406e9b03ca31",
+    "lines": [
+      [
+        173,
+        179
+      ]
+    ],
+    "keywords": [
+      "double",
+      "loading",
+      "streaks",
+      "wet",
+      "pickup"
+    ]
+  },
+  {
+    "id": "oil-impasto",
+    "title": "Impasto handling at the easel",
+    "source": "notes/techniques.md",
+    "sha256": "cc3b9f6dad29a63db546568c1b5303a1ba0c405ed771e85c8925406e9b03ca31",
+    "lines": [
+      [
+        197,
+        208
+      ]
+    ],
+    "keywords": [
+      "impasto",
+      "bristle",
+      "ridges",
+      "thickness"
+    ]
+  },
+  {
+    "id": "oil-knife",
+    "title": "Knife handling at the easel",
+    "source": "notes/techniques.md",
+    "sha256": "cc3b9f6dad29a63db546568c1b5303a1ba0c405ed771e85c8925406e9b03ca31",
+    "lines": [
+      [
+        210,
+        220
+      ]
+    ],
+    "keywords": [
+      "knife",
+      "scraping",
+      "spread",
+      "flatten"
+    ]
+  },
+  {
+    "id": "oil-blending",
+    "title": "Blending at the easel",
+    "source": "notes/techniques.md",
+    "sha256": "cc3b9f6dad29a63db546568c1b5303a1ba0c405ed771e85c8925406e9b03ca31",
+    "lines": [
+      [
+        221,
+        234
+      ]
+    ],
+    "keywords": [
+      "blend",
+      "blending",
+      "transitions",
+      "brush",
+      "pressure"
+    ]
+  },
+  {
+    "id": "oil-glazes",
+    "title": "Glazing and scumbling at the easel",
+    "source": "notes/techniques.md",
+    "sha256": "cc3b9f6dad29a63db546568c1b5303a1ba0c405ed771e85c8925406e9b03ca31",
+    "lines": [
+      [
+        235,
+        252
+      ]
+    ],
+    "keywords": [
+      "glaze",
+      "glazing",
+      "scumble",
+      "scumbling",
+      "transparent",
+      "dry",
+      "paint"
+    ]
+  },
+  {
+    "id": "oil-rag-time",
+    "title": "Rag handling and drying time at the easel",
+    "source": "notes/techniques.md",
+    "sha256": "cc3b9f6dad29a63db546568c1b5303a1ba0c405ed771e85c8925406e9b03ca31",
+    "lines": [
+      [
+        281,
+        327
+      ]
+    ],
+    "keywords": [
+      "rag",
+      "lifting",
+      "spirits",
+      "smearing",
+      "set",
+      "paint",
+      "drying",
+      "wet",
+      "repair",
+      "time"
+    ]
+  }
+]

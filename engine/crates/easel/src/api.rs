@@ -1,0 +1,3158 @@
+//! The painter's Lua API over the engine.
+//!
+//! Everything a chunk can call is registered here as globals. The state a
+//! painting builds up (the canvas, the style, the clock, the brushes in the
+//! hand, the piles on the palette) lives in `Studio`, shared by the
+//! closures through an `Rc`.
+//!
+//! Paint reaches the canvas only as piles: parts of named tubes knifed
+//! together (`pile{}`), loaded on a brush (`b:load(p)`) or dipped into by
+//! a covering pass (`work{pile=p}`, `stipple{pile=p}`, a brushed glaze
+//! `work(m, {hand="glaze", pile=p})`), and a ground made of a pile. What a pile looks like on the canvas is what
+//! the engine's pigment physics makes of it.
+//!
+//! Painter functions (angle and coverage fields) are Lua closures, which
+//! can't run on the engine's rayon threads, so they are sampled serially onto
+//! a grid in canvas units first (`FIELD_STEP`, over the mask's bounding box)
+//! and read back bilinearly. Mask functions are evaluated at every pixel.
+
+use mlua::{Function, Lua, MetaMethod, ObjectLike, Result, Table, UserData, UserDataMethods, Value, Variadic};
+use paint::palette::Mixture;
+use paint::{Apply, Canvas, Fbm, Frame, Gesture, Ground, Handling, Held, Linen, Mask, Order, Orient, Palette, Rgb, Rng, Shape, Stipple, Style, Tool, Touch};
+use crate::time::{self, Verb};
+use std::cell::RefCell;
+use std::rc::{Rc, Weak};
+
+#[path = "draw_pencil.rs"]
+pub(crate) mod draw_pencil;
+#[path = "draw_rag.rs"]
+mod draw_rag;
+#[path = "draw_soak.rs"]
+mod draw_soak;
+
+/// Grid spacing (units) that painter fields are sampled on.
+pub const FIELD_STEP: f32 = 2.0;
+
+pub struct Studio {
+    #[cfg(test)]
+    pub(crate) pass_feedback_disabled: bool,
+    pub(crate) drying_feedback: crate::pass_feedback::DryingFeedback,
+    pub width: usize,
+    /// The paper-and-pastel switch (session.rs `PAPER_MARK`): `canvas{paper=}`.
+    pub paper: bool,
+    pub canvas: Option<Canvas>,
+    pub recording_ground: u64,
+    pub style: Option<Rc<Style>>,
+    /// Arguments `canvas{}` was called with (for status).
+    pub setup: Option<String>,
+    /// The `canvas{...}` call that set this canvas up, as Lua (`lua_src`): the scratch
+    /// canvas beside the painting is set up with it (main.rs `Server::scratch`).
+    pub canvas_src: Option<String>,
+    pub seed: u64,
+    /// Index of the chunk being run (1-based), for seeds.
+    pub chunk: u64,
+    /// Engine calls made in this chunk, for automatic seeds.
+    pub calls: u64,
+    pub mark_effects: u64,
+    /// Painting time in minutes since `canvas{}` (hand time and waits).
+    pub clock: f64,
+    pub clock0: f64,
+    pub rng: Rng,
+    pub brushes: Vec<Weak<RefCell<Held>>>,
+    /// The painting knives in hand (snapshotted with the brushes).
+    pub knives: Vec<Weak<RefCell<paint::Knife>>>,
+    /// The rags in the hand (draw_rag.rs), held as the brushes are.
+    pub rags: Vec<Weak<RefCell<paint::rag::Rag>>>,
+    pub out: String,
+    /// Time spent evaluating Lua fields in this chunk (s).
+    pub field_secs: f64,
+    /// The last world view made (`w:view()`): what `visible=`, `behind=` and
+    /// `at=` resolve against (depth.rs).
+    pub view: Option<crate::world::ViewU>,
+    /// The hand's state: the piles on the palette (time.rs).
+    pub hand: crate::time::Hand,
+    /// The tubes piles are knifed from.
+    pub tubes: Rc<Palette>,
+    /// The palette board: the heaps knifed out on it (board.rs).
+    pub board: crate::board::Board,
+    /// The running chunk is a live session's (not a replay's): its verbs report progress
+    /// (session.rs `PROGRESS`).
+    pub live: bool,
+}
+
+impl Studio {
+    pub fn new(width: usize, tubes: Palette) -> Self {
+        Studio {
+            #[cfg(test)]
+            pass_feedback_disabled: false,
+            drying_feedback: Default::default(),
+            width, paper: false, canvas: None, recording_ground: 0, style: None, setup: None, canvas_src: None, seed: 1, chunk: 0, calls: 0, mark_effects: 0, clock: 0.0, clock0: 0.0, rng: Rng::new(1), brushes: Vec::new(), knives: Vec::new(), rags: Vec::new(), out: String::new(), field_secs: 0.0, view: None, hand: crate::time::Hand::default(), board: crate::board::Board { refuses_full: tubes.full_palette_refuses, ..Default::default() }, tubes: Rc::new(tubes), live: false
+        }
+    }
+    /// Start chunk `n`: its randomness depends only on the seed and `n`.
+    pub fn begin(&mut self, n: u64) {
+        self.chunk = n;
+        self.calls = 0;
+        self.mark_effects = 0;
+        self.rng = Rng::new(mixseed(self.seed, n, 0xC0FFEE));
+        self.out.clear();
+        self.drying_feedback.begin();
+        self.field_secs = 0.0;
+    }
+
+    pub(crate) fn auto_seed(&mut self) -> u64 {
+        self.calls += 1;
+        mixseed(self.seed, self.chunk, self.calls)
+    }
+
+    pub fn live_knives(&mut self) -> Vec<Rc<RefCell<paint::Knife>>> {
+        self.knives.retain(|w| w.strong_count() > 0);
+        self.knives.iter().filter_map(|w| w.upgrade()).collect()
+    }
+
+    pub fn live_brushes(&mut self) -> Vec<Rc<RefCell<Held>>> {
+        self.brushes.retain(|w| w.strong_count() > 0);
+        self.brushes.iter().filter_map(|w| w.upgrade()).collect()
+    }
+
+    pub fn live_rags(&mut self) -> Vec<Rc<RefCell<paint::rag::Rag>>> {
+        self.rags.retain(|w| w.strong_count() > 0);
+        self.rags.iter().filter_map(|w| w.upgrade()).collect()
+    }
+}
+
+pub fn mixseed(a: u64, b: u64, c: u64) -> u64 {
+    let mut z = a.wrapping_mul(0x9E3779B97F4A7C15) ^ b.wrapping_mul(0xBF58476D1CE4E5B9) ^ c.wrapping_mul(0x94D049BB133111EB);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+pub(crate) type S = Rc<RefCell<Studio>>;
+
+pub(crate) fn err<T>(msg: impl Into<String>) -> Result<T> {
+    Err(mlua::Error::runtime(msg.into()))
+}
+
+// ---------------------------------------------------------------- fields
+
+/// A painter field sampled on a grid in canvas units.
+#[derive(Clone)]
+pub(crate) struct Grid<const N: usize> {
+    x0: f32,
+    y0: f32,
+    step: f32,
+    nx: usize,
+    ny: usize,
+    v: Vec<[f32; N]>,
+}
+
+impl<const N: usize> Grid<N> {
+    pub(crate) fn get(&self, x: f32, y: f32) -> [f32; N] {
+        let fx = ((x - self.x0) / self.step).clamp(0.0, (self.nx - 1) as f32);
+        let fy = ((y - self.y0) / self.step).clamp(0.0, (self.ny - 1) as f32);
+        let (i, j) = ((fx as usize).min(self.nx.saturating_sub(2)), (fy as usize).min(self.ny.saturating_sub(2)));
+        let (tx, ty) = (fx - i as f32, fy - j as f32);
+        let at = |a: usize, b: usize| self.v[b.min(self.ny - 1) * self.nx + a.min(self.nx - 1)];
+        let (a, b, c, d) = (at(i, j), at(i + 1, j), at(i, j + 1), at(i + 1, j + 1));
+        let mut o = [0.0; N];
+        for k in 0..N {
+            o[k] = (a[k] * (1.0 - tx) + b[k] * tx) * (1.0 - ty) + (c[k] * (1.0 - tx) + d[k] * tx) * ty;
+        }
+        o
+    }
+}
+
+/// Box (units) a field is needed in: the mask's support grown by `pad`.
+pub(crate) fn support(m: Option<&Mask>, f: Frame, pad: f32) -> (f32, f32, f32, f32) {
+    support_with_pixels(m, f, pad).0
+}
+
+pub(crate) fn support_with_pixels(m: Option<&Mask>, f: Frame, pad: f32) -> ((f32, f32, f32, f32), (usize, usize, usize, usize)) {
+    let (w, h) = (f.width(), f.height());
+    let Some(m) = m else { return ((0.0, 0.0, w, h), (0, 0, f.w, f.h)) };
+    let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0, 0);
+    for (i, &v) in m.data.iter().enumerate() {
+        if v > 0.0 {
+            let (x, y) = (i % f.w, i / f.w);
+            x0 = x0.min(x);
+            x1 = x1.max(x);
+            y0 = y0.min(y);
+            y1 = y1.max(y);
+        }
+    }
+    if x0 == usize::MAX {
+        return ((0.0, 0.0, 0.0, 0.0), (0, 0, 0, 0));
+    }
+    let s = f.scale;
+    ((((x0 as f32) / s - pad).max(0.0), ((y0 as f32) / s - pad).max(0.0), ((x1 + 1) as f32 / s + pad).min(w), ((y1 + 1) as f32 / s + pad).min(h)), (x0, y0, x1 + 1, y1 + 1))
+}
+
+pub(crate) fn sample<const N: usize>(st: &S, fun: &Function, b: (f32, f32, f32, f32), conv: impl Fn(Value) -> Result<[f32; N]>) -> Result<Grid<N>> {
+    let t0 = std::time::Instant::now();
+    let step = FIELD_STEP;
+    let nx = (((b.2 - b.0) / step).ceil() as usize + 1).max(2);
+    let ny = (((b.3 - b.1) / step).ceil() as usize + 1).max(2);
+    let mut v = Vec::with_capacity(nx * ny);
+    for j in 0..ny {
+        for i in 0..nx {
+            // nodes past the box (the last row and column) sample just inside
+            // it: a field is never asked about the canvas's own edge or beyond
+            let (x, y) = ((b.0 + i as f32 * step).min(b.2 - 0.01).max(b.0), (b.1 + j as f32 * step).min(b.3 - 0.01).max(b.1));
+            let r: Value = fun.call((x, y))?;
+            v.push(conv(r)?);
+        }
+    }
+    st.borrow_mut().field_secs += t0.elapsed().as_secs_f64();
+    Ok(Grid { x0: b.0, y0: b.1, step, nx, ny, v })
+}
+
+/// `f` sampled on the field grid over `b`, as `sample` samples a Lua function.
+pub(crate) fn grid<const N: usize>(st: &S, b: (f32, f32, f32, f32), mut f: impl FnMut(f32, f32) -> Result<[f32; N]>) -> Result<Grid<N>> {
+    let t0 = std::time::Instant::now();
+    let step = FIELD_STEP;
+    let nx = (((b.2 - b.0) / step).ceil() as usize + 1).max(2);
+    let ny = (((b.3 - b.1) / step).ceil() as usize + 1).max(2);
+    let mut v = Vec::with_capacity(nx * ny);
+    for j in 0..ny {
+        for i in 0..nx {
+            v.push(f((b.0 + i as f32 * step).min(b.2 - 0.01).max(b.0), (b.1 + j as f32 * step).min(b.3 - 0.01).max(b.1))?);
+        }
+    }
+    st.borrow_mut().field_secs += t0.elapsed().as_secs_f64();
+    Ok(Grid { x0: b.0, y0: b.1, step, nx, ny, v })
+}
+
+pub(crate) type FieldBox<T> = Box<dyn Fn(f32, f32) -> T + Sync>;
+
+pub(crate) fn scalar_field(st: &S, v: &Value, b: (f32, f32, f32, f32), what: &str) -> Result<FieldBox<f32>> {
+    // a noise: read natively (0..1)
+    if let Value::UserData(u) = v
+        && let Ok(n) = u.borrow::<Noise>()
+    {
+        let n = *n;
+        return Ok(Box::new(move |x, y| n.get01(x, y)));
+    }
+    match v {
+        Value::Function(f) => {
+            let what = what.to_string();
+            let g = sample::<1>(st, f, b, |r| match r {
+                Value::Number(n) => Ok([n as f32]),
+                Value::Integer(n) => Ok([n as f32]),
+                o => err(format!("{what} function returned {}, want a number", o.type_name())),
+            })?;
+            Ok(Box::new(move |x, y| g.get(x, y)[0]))
+        }
+        Value::Number(n) => {
+            let n = *n as f32;
+            Ok(Box::new(move |_, _| n))
+        }
+        Value::Integer(n) => {
+            let n = *n as f32;
+            Ok(Box::new(move |_, _| n))
+        }
+        o => err(format!("{what}: want a number or a function(x, y), got {}", o.type_name())),
+    }
+}
+
+/// Angles are interpolated as directions (cos, sin), so a field that wraps
+/// through ±π stays smooth.
+fn angle_field(st: &S, v: &Value, b: (f32, f32, f32, f32)) -> Result<FieldBox<f32>> {
+    // a form's own field (f:field("fall")): read natively, no grid
+    if let Value::UserData(u) = v
+        && let Ok(fu) = u.borrow::<crate::form::FieldU>()
+    {
+        return Ok(fu.angle(0.0));
+    }
+    // an old log's rock field (r:field("plane"), legacy.rs): read natively too
+    if let Some(f) = crate::legacy::angle_field(v) {
+        return Ok(f);
+    }
+    if let Value::Function(f) = v {
+        let g = sample::<2>(st, f, b, |r| {
+            let a = match r {
+                Value::Number(n) => n as f32,
+                Value::Integer(n) => n as f32,
+                o => return err(format!("angle function returned {}, want radians", o.type_name())),
+            };
+            Ok([a.cos(), a.sin()])
+        })?;
+        Ok(Box::new(move |x, y| {
+            let [c, s] = g.get(x, y);
+            s.atan2(c)
+        }))
+    } else {
+        scalar_field(st, v, b, "angle")
+    }
+}
+
+// ---------------------------------------------------------------- tables
+
+pub(crate) fn num(t: &Table, k: &str) -> Result<Option<f32>> {
+    let v = t.get::<Value>(k)?;
+    let kind = v.type_name();
+    t.weak_lua().upgrade().unpack(v).map_err(|_| mlua::Error::runtime(format!("{k}: want a number, got {kind}")))
+}
+
+/// A pair from {a, b} or a single number (both the same).
+pub(crate) fn pair(t: &Table, k: &str) -> Result<Option<(f32, f32)>> {
+    match t.get::<Value>(k)? {
+        Value::Nil => Ok(None),
+        Value::Number(n) => Ok(Some((n as f32, n as f32))),
+        Value::Integer(n) => Ok(Some((n as f32, n as f32))),
+        Value::Table(p) => Ok(Some((p.get(1)?, p.get(2)?))),
+        o => err(format!("{k}: want a number or {{a, b}}, got {}", o.type_name())),
+    }
+}
+
+/// Points from {{x, y}, ...} or {x1, y1, x2, y2, ...}.
+pub(crate) fn points(v: &Value) -> Result<Vec<(f32, f32)>> {
+    let Value::Table(t) = v else { return err(format!("points: want {{{{x, y}}, ...}} or {{x1, y1, x2, y2, ...}}, got {}", v.type_name())) };
+    let mut out = Vec::new();
+    match t.get::<Value>(1)? {
+        Value::Table(_) => {
+            for (i, p) in t.sequence_values::<Value>().enumerate() {
+                let shape = || mlua::Error::runtime(format!("points: point {}: want {{x, y}}, two numbers", i + 1));
+                let Value::Table(p) = p? else { return Err(shape()) };
+                out.push((p.get(1).map_err(|_| shape())?, p.get(2).map_err(|_| shape())?));
+            }
+        }
+        _ => {
+            let v: Vec<f32> = t.sequence_values::<f32>().enumerate().map(|(i, x)| x.map_err(|_| mlua::Error::runtime(format!("points: entry {}: want a number", i + 1)))).collect::<Result<_>>()?;
+            if !v.len().is_multiple_of(2) {
+                return err("points: a flat list needs an even count (x1, y1, x2, y2, ...)");
+            }
+            out = v.chunks(2).map(|c| (c[0], c[1])).collect();
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn check_keys(t: &Table, allowed: &[&str], what: &str) -> Result<()> {
+    for kv in t.clone().pairs::<Value, Value>() {
+        let (k, _) = kv?;
+        if let Value::String(s) = &k {
+            let s = s.to_str()?.to_string();
+            if !allowed.contains(&s.as_str()) {
+                return err(format!("{what}: unknown option {s:?} (options: {})", allowed.join(", ")));
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------- tools
+
+const TOOL_KINDS: &str = "round, flat, filbert, fan, rigger, badger, stippler";
+
+fn tool_named(kind: &str, width: f32) -> Result<Tool> {
+    if !(width > 0.0 && width.is_finite()) {
+        return err(format!("brush width {width}: want > 0 (canvas units; the canvas is 1000 wide)"));
+    }
+    Ok(match kind {
+        "round" | "sable" => Tool::round_sable(width),
+        "flat" | "hog" => Tool::hog_flat(width),
+        "filbert" => Tool::filbert(width),
+        "fan" => Tool::fan(width),
+        "rigger" | "liner" => Tool::rigger(width),
+        "badger" | "blender" => Tool::badger(width),
+        "stippler" => Tool::stippler(width),
+        o => return err(format!("brush kind {o:?}: use one of {TOOL_KINDS}")),
+    })
+}
+
+/// What a brush table may say (`tool_of`), besides its kind and width given in order.
+const TOOL_KEYS: &[&str] = &["kind", "width", "length", "stiffness", "hair", "run", "lay", "pickup", "push", "splay", "ragged", "point", "bristles"];
+
+/// A tool from a `Brush`, "filbert 8", or {kind, width, stiffness=...}.
+pub(crate) fn tool_of(st: &S, v: &Value) -> Result<Tool> {
+    match v {
+        Value::UserData(u) => Ok(u.borrow::<Brush>()?.held.borrow().tool.clone()),
+        Value::String(s) => {
+            let s = s.to_str()?;
+            let mut it = s.split_whitespace();
+            let kind = it.next().unwrap_or("");
+            let w: f32 = it.next().and_then(|w| w.parse().ok()).ok_or_else(|| mlua::Error::runtime(format!("tool {s:?}: want \"kind width\", e.g. \"filbert 8\"")))?;
+            tool_named(kind, w)
+        }
+        Value::Table(t) => {
+            if st.borrow().tubes.calls_agree {
+                check_keys(t, TOOL_KEYS, "brush")?;
+            }
+            let kind: String = t.get::<Option<String>>("kind")?.or(t.get::<Option<String>>(1)?).unwrap_or_else(|| "round".into());
+            let w: f32 = num(&t, "width")?.or(t.get::<Option<f32>>(2)?).ok_or_else(|| mlua::Error::runtime("tool: needs a width"))?;
+            let mut tool = tool_named(&kind, w)?;
+            macro_rules! over {
+                ($($f:ident),*) => {$( if let Some(v) = num(t, stringify!($f))? { tool.$f = v; } )*};
+            }
+            over!(length, stiffness, hair, run, lay, pickup, push, splay, ragged, point);
+            if let Some(b) = t.get::<Option<usize>>("bristles")? {
+                tool.bristles = b;
+            }
+            tool.validate().map_err(mlua::Error::runtime)?;
+            Ok(tool)
+        }
+        o => err(format!("tool: want a brush, \"kind width\" or {{kind=, width=}}, got {}", o.type_name())),
+    }
+}
+
+fn orient_of(v: Value) -> Result<Option<Orient>> {
+    Ok(match v {
+        Value::Nil => None,
+        Value::String(s) => match &*s.to_str()? {
+            "across" => Some(Orient::Across),
+            "along" => Some(Orient::Along),
+            o => return err(format!("orient {o:?}: \"across\", \"along\" or an angle")),
+        },
+        Value::Number(n) => Some(Orient::Fixed(n as f32)),
+        Value::Integer(n) => Some(Orient::Fixed(n as f32)),
+        o => return err(format!("orient: got {}", o.type_name())),
+    })
+}
+
+/// A brush in the hand: it keeps its paint between strokes and chunks.
+#[derive(Clone)]
+pub struct Brush {
+    held: Rc<RefCell<Held>>,
+    st: S,
+}
+
+/// A painting knife (`knife{width=}`): k:load(pile, amount), k:lay(points,
+/// {pressure=, angle=, lift=}), k:scrape(points, {pressure=, angle=}), k:wipe().
+pub struct KnifeU {
+    pub(crate) k: Rc<RefCell<paint::Knife>>,
+    st: S,
+}
+
+impl UserData for KnifeU {
+    fn add_fields<F: mlua::UserDataFields<Self>>(f: &mut F) {
+        f.add_field_method_get("width", |_, k| Ok(k.k.borrow().width));
+    }
+    fn add_methods<M: UserDataMethods<Self>>(m: &mut M) {
+        m.add_method("load", |_, k, (p, amount): (Value, Option<f32>)| {
+            let amount = load_amount(amount, 0.6, "k:load")?;
+            if !(0.0..=1.0).contains(&amount) { return err("k:load: amount is a share of a full load (0..1)"); }
+            let carry = 0.5 * k.k.borrow().fullness().min(1.0);
+            let (paint, color) = brushload(&k.st, &p, &Value::Nil, "load", carry, &k.k.borrow().carried_parts())?;
+            k.k.borrow_mut().load(paint, amount);
+            time::trip(&k.st, color);
+            Ok(())
+        });
+        m.add_method("wipe", |_, k, ()| {
+            k.k.borrow_mut().wipe();
+            // (a wipe on the rag takes the hand's time, as a brush's)
+            if let Some(c) = k.st.borrow_mut().canvas.as_mut() {
+                c.tally_mut().wipe();
+            }
+            Ok(())
+        });
+        m.add_method("fullness", |_, k, ()| Ok(k.k.borrow().fullness()));
+        for (name, lay) in [("lay", true), ("scrape", false)] {
+            m.add_method(name, move |_, k, (pts, o): (Value, Option<Table>)| {
+                let pts = points(&pts)?;
+                if pts.is_empty() {
+                    return err(format!("k:{name}: needs points"));
+                }
+                let (mut pressure, mut angle, mut lift) = (if lay { (0.5, 0.5) } else { (1.0, 1.0) }, None, if lay { 0.1 } else { 0.0 });
+                // edge=: the blade's edge radius over pastel on paper (the
+                // paper-and-pastel switch's; paint's sheet.rs `scrape_pastel`)
+                let paper = k.st.borrow().paper;
+                let mut edge = 100.0f32;
+                if let Some(o) = &o {
+                    check_keys(o, if !lay && paper { &["pressure", "angle", "lift", "edge"] } else { &["pressure", "angle", "lift"] }, &format!("k:{name}"))?;
+                    if !lay && paper && let Some(e) = num(o, "edge")? {
+                        if !(1.0..=1000.0).contains(&e) {
+                            return err("k:scrape: edge is the blade's edge radius, µm (a painting knife's 20–500; a scalpel's about 1)");
+                        }
+                        edge = e;
+                    }
+                    if let Some(p) = pair(o, "pressure")? {
+                        pressure = p;
+                    }
+                    angle = num(o, "angle")?;
+                    if let Some(l) = num(o, "lift")? {
+                        if !l.is_finite() { return err(format!("k:{name}: lift must be finite")); }
+                        lift = l.clamp(0.0, 1.0);
+                    }
+                }
+                if !pressure.0.is_finite() || !pressure.1.is_finite() || angle.is_some_and(|a| !a.is_finite()) {
+                    return err(format!("k:{name}: pressure and angle must be finite"));
+                }
+                let scale = k.st.borrow().width as f32 / 1000.0;
+                if let Err(e) = paint::Knife::check_path(&pts, scale) { return err(format!("k:{name}: {e}")); }
+                time::verb(&k.st, Verb::Marks, |s| {
+                    let c = s.canvas.as_mut().ok_or_else(no_canvas)?;
+                    c.knife(&mut k.k.borrow_mut(), &pts, pressure, angle, lay, lift);
+                    if !lay && paper {
+                        // the blade on pastel on paper: it sinks into the
+                        // sheet and takes the loose pastel above its edge,
+                        // and presses the paper (paint's sheet.rs; nothing
+                        // without paper and a drawing)
+                        let width = k.k.borrow().width;
+                        c.scrape_pastel(width, edge, &pts, pressure, angle);
+                    }
+                    Ok(())
+                })
+            });
+        }
+    }
+}
+
+impl UserData for Brush {
+    fn add_fields<F: mlua::UserDataFields<Self>>(f: &mut F) {
+        f.add_field_method_get("width", |_, b| Ok(b.held.borrow().tool.width));
+        f.add_field_method_get("kind", |_, b| Ok(format!("{:?}", b.held.borrow().tool.kind).to_lowercase()));
+    }
+    fn add_methods<M: UserDataMethods<Self>>(m: &mut M) {
+        // b:load(pile, amount?): dip into a pile on the palette (amount 0..1 of a full load)
+        // b:load(pile, amount, {side=, share=, streak=}): only part of the brush goes in
+        m.add_method("load", |_, b, (p, amount, extra): (Value, Option<f32>, Value)| {
+            // (before anything is drawn from the session's randomness: a refused load leaves it as it was)
+            let amount = load_amount(amount, 0.8, "b:load")?;
+            if b.st.borrow().tubes.calls_agree && !(0.0..=1.0).contains(&amount) {
+                return err("b:load: amount is a share of a full load (0..1)");
+            }
+            // (on a legacy canvas a table is its load's options: brushload's)
+            let legacy = crate::legacy::on(&b.st);
+            if let Value::Table(t) = &extra
+                && !legacy
+            {
+                check_keys(t, PART_KEYS, "b:load")?;
+                let mut part = part_of(t, "b:load")?;
+                let carry = b.held.borrow().fullness().min(1.0);
+                let (paint, color) = brushload(&b.st, &p, &Value::Nil, "load", carry, &b.held.borrow().carried_parts())?;
+                part.seed = b.st.borrow_mut().rng.next_u64();
+                b.held.borrow_mut().load_part(paint, amount, &part);
+                time::trip(&b.st, color);
+                return Ok(());
+            }
+            let carry = b.held.borrow().fullness().min(1.0);
+            let (paint, color) = brushload(&b.st, &p, &extra, "load", carry, &b.held.borrow().carried_parts())?;
+            b.held.borrow_mut().load(paint, amount);
+            time::trip(&b.st, color);
+            Ok(())
+        });
+        // b:reload(pile, amount?): wipe most of the old paint off, then load
+        m.add_method("reload", |_, b, (p, amount, extra): (Value, Option<f32>, Value)| {
+            let amount = if b.st.borrow().tubes.reload_finite { load_amount(amount, 0.8, "b:reload")? } else { amount.unwrap_or(0.8) };
+            if b.st.borrow().tubes.calls_agree && !(0.0..=1.0).contains(&amount) {
+                return err("b:reload: amount is a share of a full load (0..1)");
+            }
+            // it is wiped first: only what the rag left goes into the heap
+            let carry = 0.15 * b.held.borrow().fullness().min(1.0);
+            let (paint, color) = brushload(&b.st, &p, &extra, "reload", carry, &b.held.borrow().carried_parts())?;
+            b.held.borrow_mut().reload(paint, amount);
+            time::trip(&b.st, color);
+            Ok(())
+        });
+        m.add_method("wipe", |_, b, frac: Option<f32>| {
+            b.held.borrow_mut().wipe(frac.unwrap_or(0.85));
+            if let Some(c) = b.st.borrow_mut().canvas.as_mut() {
+                c.tally_mut().wipe();
+            }
+            Ok(())
+        });
+        m.add_method("fullness", |_, b, ()| Ok(b.held.borrow().fullness()));
+        // pointed tips: how wide a mark at this pressure, what pressure for this width
+        m.add_method("mark_width", |_, b, p: f32| Ok(b.held.borrow().tool.mark_width(p)));
+        m.add_method("pressure_for", |_, b, w: f32| Ok(b.held.borrow().tool.pressure_for(w)));
+        // b:stroke(points, {pressure=, ramps=, orient=, shake=, swell=, clip=})
+        m.add_method("stroke", |_, b, (pts, o): (Value, Option<Table>)| {
+            let pts = points(&pts)?;
+            if pts.len() < 2 {
+                return err("stroke: needs at least two points");
+            }
+            let mut g = Gesture::new(pts);
+            let mut clip = None;
+            if let Some(o) = &o {
+                check_keys(o, &["pressure", "ramps", "orient", "shake", "swell", "clip"], "stroke")?;
+                if let Some((a, z)) = pair(o, "pressure")? {
+                    g = g.pressure(a, z);
+                }
+                if let Some((a, z)) = pair(o, "ramps")? {
+                    g = g.ramps(a, z);
+                }
+                if let Some(or) = orient_of(o.get("orient")?)? {
+                    g = g.orient(or);
+                }
+                if let Some(s) = num(o, "shake")? {
+                    g = g.shake(s);
+                }
+                if let Some(s) = o.get::<Option<Vec<f32>>>("swell")? {
+                    g = g.swell(s);
+                }
+                clip = mask_opt(&b.st, o.get("clip")?)?;
+            }
+            time::verb(&b.st, Verb::Marks, |s| {
+                s.canvas.as_mut().ok_or_else(no_canvas)?.drag(&mut b.held.borrow_mut(), &g, clip.as_deref());
+                Ok(())
+            })
+        });
+        // b:gesture({{x, y, p}, ...}, {wobble=, orient=, ramps=, shake=, clip=}): one deliberate
+        // stroke along a smooth curve through the points, its pressure following each
+        // point's p (0..1; a point without one takes its neighbors')
+        m.add_method("gesture", |_, b, (pts, o): (Value, Option<Table>)| {
+            let Value::Table(t) = &pts else { return err("gesture: want {{x, y, p}, ...}") };
+            let mut ctl: Vec<(f32, f32, Option<f32>)> = Vec::new();
+            for p in t.sequence_values::<Table>() {
+                let p = p?;
+                let pr: Option<f32> = p.get(3)?;
+                if let Some(v) = pr {
+                    if !(0.0..=1.0).contains(&v) {
+                        return err("gesture: a point's pressure p is 0..1");
+                    }
+                }
+                let (x, y): (f32, f32) = (p.get(1)?, p.get(2)?);
+                // (before the curve is sampled: a sample every unit or so of a
+                // point that is nowhere would never end)
+                if !(x.is_finite() && y.is_finite() && x.abs() <= GESTURE_REACH && y.abs() <= GESTURE_REACH) {
+                    return err(format!("gesture: the point {{{x}, {y}}} is not on or near the canvas (units, within {GESTURE_REACH} of its corner)"));
+                }
+                ctl.push((x, y, pr));
+            }
+            if ctl.len() < 2 {
+                return err("gesture: needs at least two points");
+            }
+            if ctl.len() > 2000 {
+                return err("gesture: one stroke, of at most 2000 points");
+            }
+            // pressures: missing ones from their neighbors, the ends 0.8 if none is given
+            let given: Vec<(usize, f32)> = ctl.iter().enumerate().filter_map(|(i, c)| c.2.map(|p| (i, p))).collect();
+            let pres: Vec<f32> = (0..ctl.len())
+                .map(|i| {
+                    if given.is_empty() {
+                        return 0.8;
+                    }
+                    let before = given.iter().rev().find(|g| g.0 <= i);
+                    let after = given.iter().find(|g| g.0 >= i);
+                    match (before, after) {
+                        (Some(a), Some(c)) if c.0 > a.0 => a.1 + (c.1 - a.1) * (i - a.0) as f32 / (c.0 - a.0) as f32,
+                        (Some(a), _) => a.1,
+                        (_, Some(c)) => c.1,
+                        _ => 0.8,
+                    }
+                })
+                .collect();
+            let mut wobble = 0.0f32;
+            let mut g_orient = None;
+            let (mut ramps, mut shake, mut clip) = (None, None, None);
+            if let Some(o) = &o {
+                check_keys(o, &["wobble", "orient", "ramps", "shake", "clip"], "gesture")?;
+                wobble = num(o, "wobble")?.unwrap_or(0.0);
+                if !(wobble.is_finite() && (0.0..=100.0).contains(&wobble)) { return err("gesture: wobble must be 0 to 100 units"); }
+                g_orient = orient_of(o.get("orient")?)?;
+                ramps = pair(o, "ramps")?;
+                shake = num(o, "shake")?;
+                clip = mask_opt(&b.st, o.get("clip")?)?;
+            }
+            // a Catmull-Rom curve through the points, a sample every unit or so,
+            // with the pressure carried along it
+            let n = ctl.len();
+            let at = |i: isize| { let i = i.clamp(0, n as isize - 1) as usize; (ctl[i].0, ctl[i].1, pres[i]) };
+            // Bound the whole sampled stroke before allocating its path and arc.
+            let samples: usize = ctl.windows(2).map(|p| {
+                let seg = ((p[1].0 - p[0].0).powi(2) + (p[1].1 - p[0].1).powi(2)).sqrt();
+                (seg / 1.5).ceil().max(2.0) as usize
+            }).sum();
+            if samples > 100_000 {
+                return err("gesture: the sampled stroke is too long (at most 100000 samples)");
+            }
+            let mut path: Vec<(f32, f32, f32)> = Vec::with_capacity(samples + 1);
+            // (where each point lies on the path)
+            let mut at_ctl: Vec<usize> = Vec::with_capacity(n);
+            for i in 0..n - 1 {
+                at_ctl.push(path.len());
+                let (p0, p1, p2, p3) = (at(i as isize - 1), at(i as isize), at(i as isize + 1), at(i as isize + 2));
+                let seg = ((p2.0 - p1.0).powi(2) + (p2.1 - p1.1).powi(2)).sqrt();
+                let k = (seg / 1.5).ceil().max(2.0) as usize;
+                for j in 0..k {
+                    let t = j as f32 / k as f32;
+                    let (t2, t3) = (t * t, t * t * t);
+                    let cr = |a: f32, b: f32, c: f32, d: f32| 0.5 * (2.0 * b + (-a + c) * t + (2.0 * a - 5.0 * b + 4.0 * c - d) * t2 + (-a + 3.0 * b - 3.0 * c + d) * t3);
+                    path.push((cr(p0.0, p1.0, p2.0, p3.0), cr(p0.1, p1.1, p2.1, p3.1), p1.2 + (p2.2 - p1.2) * t));
+                }
+            }
+            at_ctl.push(path.len());
+            path.push(at(n as isize - 1));
+            // a hand's wobble: a slow sideways drift, units
+            if wobble > 0.0 {
+                let seed = b.st.borrow_mut().rng.next_u64();
+                let nz = paint::Fbm::new(seed as u32, 2, 40.0);
+                let mut out = path.clone();
+                let mut s_len = 0.0f32;
+                for i in 1..path.len() - 1 {
+                    let (dx, dy) = (path[i + 1].0 - path[i - 1].0, path[i + 1].1 - path[i - 1].1);
+                    let m = (dx * dx + dy * dy).sqrt().max(1e-6);
+                    s_len += ((path[i].0 - path[i - 1].0).powi(2) + (path[i].1 - path[i - 1].1).powi(2)).sqrt();
+                    let w = wobble * nz.get(s_len, 0.0);
+                    out[i].0 += -dy / m * w;
+                    out[i].1 += dx / m * w;
+                }
+                path = out;
+            }
+            // pressure: evenly spaced knots along the curve
+            let mut arc = vec![0.0f32; path.len()];
+            for i in 1..path.len() {
+                arc[i] = arc[i - 1] + ((path[i].0 - path[i - 1].0).powi(2) + (path[i].1 - path[i - 1].1).powi(2)).sqrt();
+            }
+            let total = arc[arc.len() - 1].max(1e-6);
+            // (knots close enough to follow the closest points, 16 to 512 spans;
+            // and each point's own pressure, where it is a peak or a dip, kept
+            // at the knot nearest it: a press between two knots is not lost)
+            let closest = at_ctl.windows(2).map(|w| arc[w[1]] - arc[w[0]]).filter(|d| *d > 1e-3).fold(f32::MAX, f32::min);
+            let spans = if closest == f32::MAX { 16 } else { ((2.0 * total / closest).ceil() as usize).clamp(16, 512) };
+            let mut knots: Vec<f32> = (0..=spans)
+                .map(|q| {
+                    let d = total * q as f32 / spans as f32;
+                    let j = arc.partition_point(|&a| a < d).clamp(1, arc.len() - 1);
+                    let (a0, a1) = (arc[j - 1], arc[j]);
+                    let f = if a1 > a0 { (d - a0) / (a1 - a0) } else { 0.0 };
+                    (path[j - 1].2 + (path[j].2 - path[j - 1].2) * f).max(0.0)
+                })
+                .collect();
+            for i in 0..n {
+                let (p, before, after) = (pres[i], pres[i.saturating_sub(1)], pres[(i + 1).min(n - 1)]);
+                let q = ((arc[at_ctl[i]] / total * spans as f32).round() as usize).min(spans);
+                if p >= before && p >= after {
+                    knots[q] = knots[q].max(p);
+                } else if p <= before && p <= after {
+                    knots[q] = knots[q].min(p);
+                }
+            }
+            let mut g = Gesture::new(path.iter().map(|p| (p.0, p.1)).collect()).pressure(1.0, 1.0).swell(knots);
+            if let Some((a, z)) = ramps {
+                g = g.ramps(a, z);
+            } else {
+                // engine 8: the pressure follows the points to the end, so a
+                // limb drawn to where it forks keeps its width there (a tip
+                // tapers where its own points' pressure falls); before it
+                // the last 5% lifted off whatever the points asked
+                let release = if b.st.borrow().tubes.engine >= paint::REACH_END { 0.0 } else { 0.05 };
+                g = g.ramps(0.02, release);
+            }
+            if let Some(or) = g_orient {
+                g = g.orient(or);
+            }
+            if let Some(s) = shake {
+                g = g.shake(s);
+            }
+            time::verb(&b.st, Verb::Marks, |s| {
+                s.canvas.as_mut().ok_or_else(no_canvas)?.drag(&mut b.held.borrow_mut(), &g, clip.as_deref());
+                Ok(())
+            })
+        });
+        // b:touch(x, y, {pressure=, drag={dx,dy}, twist=, angle=, clip=})
+        m.add_method("touch", |_, b, (x, y, o): (f32, f32, Option<Table>)| {
+            let mut t = Touch::at(x, y);
+            let mut clip = None;
+            if let Some(o) = &o {
+                check_keys(o, &["pressure", "drag", "twist", "angle", "clip"], "touch")?;
+                if let Some(p) = num(o, "pressure")? {
+                    t = t.pressure(p);
+                }
+                if let Some((dx, dy)) = pair(o, "drag")? {
+                    t = t.drag(dx, dy);
+                }
+                if let Some(a) = num(o, "twist")? {
+                    t = t.twist(a);
+                }
+                if let Some(a) = num(o, "angle")? {
+                    t = t.angle(a);
+                }
+                clip = mask_opt(&b.st, o.get("clip")?)?;
+            }
+            time::verb(&b.st, Verb::Marks, |s| {
+                s.canvas.as_mut().ok_or_else(no_canvas)?.touch(&mut b.held.borrow_mut(), &t, clip.as_deref());
+                Ok(())
+            })
+        });
+        // b:spatter{at={x, y}, toward={dx, dy}, spread=, force=, clip=}: flick the loaded
+        // brush: the paint its hairs can't hold flies off in droplets toward `toward`
+        // (its length is how far the paint carries); returns how many droplets landed
+        m.add_method("spatter", |_, b, o: Table| {
+            check_keys(&o, &["at", "toward", "spread", "force", "clip"], "spatter")?;
+            let at = pair(&o, "at")?.ok_or_else(|| mlua::Error::runtime("spatter: at={x, y}, where the brush is flicked"))?;
+            let toward = pair(&o, "toward")?.ok_or_else(|| mlua::Error::runtime("spatter: toward={dx, dy}, the flick's direction and how far the paint carries (units)"))?;
+            // (refused here, as numbers, before the engine would panic on them)
+            if !(at.0.is_finite() && at.1.is_finite() && toward.0.is_finite() && toward.1.is_finite()) {
+                return err(format!("spatter: at and toward are numbers (units), not {{{}, {}}} and {{{}, {}}}", at.0, at.1, toward.0, toward.1));
+            }
+            let spread = num(&o, "spread")?.unwrap_or(0.45);
+            if !(0.0..=1.5).contains(&spread) {
+                return err("spatter: spread is half the cone's angle in radians, 0 to 1.5");
+            }
+            let force = num(&o, "force")?.unwrap_or(0.6);
+            if !(0.0..=1.0).contains(&force) {
+                return err("spatter: force is how hard the flick is, 0 to 1");
+            }
+            let clip = mask_opt(&b.st, o.get("clip")?)?;
+            let seed = b.st.borrow_mut().rng.next_u64();
+            let sp = paint::Spatter { at, toward, spread, force, seed };
+            time::verb(&b.st, Verb::Marks, |s| Ok(s.canvas.as_mut().ok_or_else(no_canvas)?.spatter(&mut b.held.borrow_mut(), &sp, clip.as_deref())))
+        });
+        m.add_meta_method(MetaMethod::ToString, |_, b, ()| {
+            let h = b.held.borrow();
+            Ok(format!("brush({:?} {}, {:.0}% full)", h.tool.kind, h.tool.width, 100.0 * h.fullness()).to_lowercase())
+        });
+    }
+}
+
+/// `b:dust(pts, {pressure=0.6, tip=})`: the brush, dry, drawn over pastel
+/// (paint's sheet.rs `dust_pastel`): loose pastel its tips reach comes away,
+/// kept in the bristles while they have room and otherwise dropped ahead of
+/// them and where they lift; what lies deeper in the tooth, and fixed pastel,
+/// stays. `tip` is the bristles' tip radius in µm (a hog's 50; finer hair
+/// reaches deeper). Returns the volume it took off the picture (into the
+/// bristles), mm³. Only with the paper-and-pastel switch (`install_paper`).
+fn add_dust<M: UserDataMethods<Brush>>(m: &mut M) {
+    m.add_method("dust", |_, b, (pts, o): (Value, Option<Table>)| {
+        let pts = points(&pts)?;
+        if pts.len() < 2 {
+            return err("b:dust: needs at least two points");
+        }
+        let (mut p, mut tip) = (0.6f32, paint::sheet::HOG_TIP_UM);
+        if let Some(o) = &o {
+            check_keys(o, &["pressure", "tip"], "b:dust")?;
+            if let Some(v) = num(o, "pressure")? {
+                // (clamp keeps a NaN: refuse it first)
+                if !v.is_finite() {
+                    return err("b:dust: pressure is a number, 0 to 1");
+                }
+                p = v.clamp(0.0, 1.0);
+            }
+            if let Some(v) = num(o, "tip")? {
+                if !(2.0..=200.0).contains(&v) {
+                    return err("b:dust: tip is the bristles' tip radius, µm (2 to 200; a hog bristle's about 50)");
+                }
+                tip = v;
+            }
+        }
+        let width = b.held.borrow().tool.mark_width(p);
+        let full_w = b.held.borrow().tool.width;
+        if b.held.borrow().fullness() > 0.02 {
+            return err("b:dust: the brush has paint on it; a dry brush brushes pastel off (b:wipe(1) first)");
+        }
+        time::verb_dry(&b.st, Verb::Pass, |s| {
+            let c = s.canvas.as_mut().ok_or_else(no_canvas)?;
+            // (the path's work bounded before it is densified, as a knife's)
+            if let Err(e) = paint::Knife::check_path(&pts, c.frame().scale) {
+                return err(format!("b:dust: {e}"));
+            }
+            // what its loaded tip holds: 2 mm of it, its width by a third of that thick
+            let w_mm = full_w * c.mm_per_unit();
+            let cap = paint::sheet::BRUSH_HOLDS_MG_MM3 * w_mm * 2.0 * 0.3 * w_mm;
+            let mut held = b.held.borrow().pastel_mg;
+            let (v, secs) = c.dust_pastel(width, tip, &pts, &mut held, cap);
+            b.held.borrow_mut().pastel_mg = held;
+            c.tally_mut().secs += secs as f64;
+            Ok(v)
+        })
+    });
+}
+
+pub(crate) fn no_canvas() -> mlua::Error {
+    mlua::Error::runtime("no canvas yet: the first chunk is canvas{size=, aspect=, linen=, ground=}")
+}
+
+pub(crate) fn style(st: &S) -> Result<Rc<Style>> {
+    st.borrow().style.clone().ok_or_else(no_canvas)
+}
+
+pub(crate) fn frame(st: &S) -> Result<Frame> {
+    Ok(st.borrow().canvas.as_ref().ok_or_else(no_canvas)?.frame())
+}
+
+// ---------------------------------------------------------------- piles
+
+/// A pile on the palette: parts of tubes knifed together, with the oil
+/// medium mixed into it.
+#[derive(Clone)]
+pub struct PileU {
+    pub mix: Mixture,
+    pub medium: f32,
+    /// Share of solvent knifed in (`paint::thinner`), engine 3: `Some` (0
+    /// when not given). `None` before engine 3, which has no thinner (so an
+    /// older log's `p.thinner` is nil, as it was).
+    pub thinner: Option<f32>,
+    /// The parts as the painter gave them (for printing).
+    parts: Vec<(String, f32)>,
+    /// Its heap on the palette board (0: none).
+    pub heap: u64,
+    st: Option<S>,
+}
+
+impl UserData for PileU {
+    fn add_fields<F: mlua::UserDataFields<Self>>(f: &mut F) {
+        f.add_field_method_get("medium", |_, p| Ok(p.current().medium));
+        f.add_field_method_get("thinner", |_, p| Ok(p.current().thinner));
+    }
+    fn add_methods<M: UserDataMethods<Self>>(m: &mut M) {
+        // p:add{{"tube name", parts}, ..., medium=}: knife more tube paint into this
+        // heap on the palette, in the units its recipe was given in; returns the pile
+        m.add_method("add", |_, p, t: Table| {
+            check_keys(&t, &["medium"], "p:add")?;
+            let st = p.st.clone().ok_or_else(|| mlua::Error::runtime("p:add: this pile isn't on a palette"))?;
+            if p.heap == 0 {
+                return err("p:add: this pile isn't on the palette board");
+            }
+            let medium = num(&t, "medium")?.unwrap_or(0.0);
+            if !(0.0..=0.95).contains(&medium) {
+                return err("p:add: medium is the share of oil medium in the added paint, 0 to 0.95");
+            }
+            let tubes = st.borrow().tubes.clone();
+            let add = tube_parts(&tubes, &t, "p:add")?;
+            check_set_out(&st, &add, "p:add")?;
+            {
+                let s = &mut *st.borrow_mut();
+                s.board.add(p.heap, &add, medium, &s.tubes).map_err(mlua::Error::runtime)?;
+            }
+            let now = resolve(&st, p.clone());
+            time::knife(&st, now.mix.color);
+            Ok(now)
+        });
+        m.add_method("parts", |lua, p, ()| {
+            let t = lua.create_table()?;
+            for (name, k) in &p.current().parts {
+                t.push(lua.create_sequence_from([Value::String(lua.create_string(name)?), Value::Number(*k as f64)])?)?;
+            }
+            Ok(t)
+        });
+        m.add_meta_method(MetaMethod::ToString, |_, p, ()| Ok(p.current().recipe()));
+    }
+}
+
+impl PileU {
+    fn current(&self) -> Self {
+        match &self.st {
+            Some(st) => resolve(st, self.clone()),
+            None => self.clone(),
+        }
+    }
+    /// What `print(p)` shows: `pile(lead white 6 (86%), smalt 1 (14%); medium 0.2)`,
+    /// and `, thinner 0.3` after the medium when the pile is thinned.
+    pub fn recipe(&self) -> String {
+        let total = self.parts.iter().map(|(_, k)| *k as f64).sum::<f64>();
+        let parts: Vec<String> = self.parts.iter().map(|(n, k)| format!("{n} {} ({:.0}%)", fmt_num(*k), 100.0 * *k as f64 / total)).collect();
+        let mut tail = if self.medium < 0.0 { format!("blotted {}", fmt_num(-self.medium)) } else { format!("medium {}", fmt_num(self.medium)) };
+        if let Some(t) = self.thinner.filter(|&t| t > 0.0) {
+            tail += &format!(", thinner {}", fmt_num(t));
+        }
+        if self.mix.solvent > 0.0 {
+            tail += &format!(", turps {}", fmt_num(self.mix.solvent));
+        }
+        if self.mix.oil_rate != 1.0 {
+            tail += if self.mix.oil_rate < 0.7 { ", in poppy oil" } else { ", in walnut oil" };
+        }
+        format!("pile({}; {tail})", parts.join(", "))
+    }
+
+    /// The share of solvent (0 unthinned, and before engine 3).
+    pub fn thinner(&self) -> f32 {
+        self.thinner.unwrap_or(0.0)
+    }
+
+    /// The paint a brush loads from this pile (before the hand's
+    /// unevenness): the mixture with its medium, thinned as knifed.
+    pub fn paint(&self) -> paint::Paint {
+        thinned(self.mix.laid(self.medium), self.thinner())
+    }
+}
+
+/// `p` thinned `t` (unchanged when `t` is 0).
+fn thinned(p: paint::Paint, t: f32) -> paint::Paint {
+    if t > 0.0 { p.with_thinner(t) } else { p }
+}
+
+/// A Lua value as Lua source that makes it again: numbers, strings, booleans and tables of
+/// them (a table's sequence first, then its other keys in order). `canvas{}`'s arguments
+/// (`Studio::canvas_src`).
+pub(crate) fn lua_src(v: &Value) -> Result<String> {
+    Ok(match v {
+        Value::Nil => "nil".into(),
+        Value::Boolean(b) => b.to_string(),
+        Value::Integer(i) => i.to_string(),
+        Value::Number(n) if n.is_finite() => format!("{n:?}"),
+        Value::String(t) => {
+            let mut q = String::from("\"");
+            for b in t.as_bytes().iter() {
+                match *b {
+                    b'"' => q.push_str("\\\""),
+                    b'\\' => q.push_str("\\\\"),
+                    32..=126 => q.push(*b as char),
+                    o => q.push_str(&format!("\\{o:03}")),
+                }
+            }
+            q.push('"');
+            q
+        }
+        Value::Table(t) => {
+            let n = t.raw_len();
+            let mut items: Vec<String> = (1..=n).map(|i| lua_src(&t.raw_get::<Value>(i)?)).collect::<Result<_>>()?;
+            let mut keyed: Vec<(String, String)> = Vec::new();
+            for pair in t.clone().pairs::<Value, Value>() {
+                let (k, v) = pair?;
+                match &k {
+                    Value::Integer(i) if (1..=n as i64).contains(i) => continue,
+                    Value::String(s) => {
+                        let s = s.to_str()?.to_string();
+                        let ident = !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !s.starts_with(|c: char| c.is_ascii_digit());
+                        let key = if ident { s } else { format!("[{}]", lua_src(&k)?) };
+                        keyed.push((key, lua_src(&v)?));
+                    }
+                    _ => keyed.push((format!("[{}]", lua_src(&k)?), lua_src(&v)?)),
+                }
+            }
+            keyed.sort();
+            items.extend(keyed.into_iter().map(|(k, v)| format!("{k}={v}")));
+            format!("{{{}}}", items.join(", "))
+        }
+        o => return err(format!("{} can't be written as Lua", o.type_name())),
+    })
+}
+
+fn fmt_num(v: f32) -> String {
+    if (v - v.round()).abs() < 1e-6 { format!("{}", v.round() as i64) } else { format!("{v}") }
+}
+
+/// Parts of tubes from `{{"lead white", 6}, {"smalt", 1}, ...}` (the table's
+/// array part): tube indices and fractions by volume summing to 1, and the
+/// parts as given.
+pub(crate) fn parts_of(tubes: &Palette, t: &Table, what: &str) -> Result<(Vec<(usize, f32)>, Vec<(String, f32)>)> {
+    let mut parts: Vec<(usize, f32)> = Vec::new();
+    let mut given = Vec::new();
+    for e in t.sequence_values::<Value>() {
+        let Value::Table(e) = e? else {
+            return err(format!("{what}: each part is {{\"tube name\", parts}} (tubes() lists the names)"));
+        };
+        let name: String = e.get::<Option<String>>(1)?.ok_or_else(|| mlua::Error::runtime(format!("{what}: each part is {{\"tube name\", parts}}")))?;
+        let k: f32 = e.get::<Option<f32>>(2)?.ok_or_else(|| mlua::Error::runtime(format!("{what}: {name:?} needs a number of parts")))?;
+        if !(k > 0.0 && k.is_finite()) {
+            return err(format!("{what}: {name:?}: parts > 0"));
+        }
+        let i = tubes.tubes.iter().position(|t| t.name == name).ok_or_else(|| {
+            mlua::Error::runtime(format!("{what}: no tube {name:?} (tubes: {})", tubes.tubes.iter().map(|t| t.name).collect::<Vec<_>>().join(", ")))
+        })?;
+        match parts.iter_mut().find(|p| p.0 == i) {
+            Some(p) => p.1 += k,
+            None => parts.push((i, k)),
+        }
+        given.push((name, k));
+    }
+    if parts.is_empty() {
+        return err(format!("{what}: needs at least one tube: {{{{\"tube name\", parts}}, ...}} (tubes() lists the names)"));
+    }
+    let sum: f32 = parts.iter().map(|p| p.1).sum();
+    if tubes.calls_agree && !sum.is_finite() {
+        return err(format!("{what}: the parts add up to more than the easel can count; give smaller numbers in the same proportions"));
+    }
+    for p in parts.iter_mut() {
+        p.1 /= sum;
+    }
+    Ok((parts, given))
+}
+
+pub(crate) fn pile_of(v: &Value, what: &str) -> Result<PileU> {
+    match v {
+        Value::UserData(u) if u.borrow::<PileU>().is_ok() => Ok(u.borrow::<PileU>()?.clone()),
+        Value::Nil => err(format!("{what}: needs a pile (p = pile{{{{\"tube name\", parts}}, ...}})")),
+        o => err(format!("{what}: want a pile (made with pile{{...}}), got {}", o.type_name())),
+    }
+}
+
+/// The pile as its heap is on the board now, the hand having gone to it with a
+/// brush carrying `carry` of the last paint (board.rs). A heap untouched since
+/// it was knifed is the pile exactly as knifed.
+pub(crate) fn pile_now(st: &S, v: &Value, what: &str, carry: f32) -> Result<PileU> {
+    let p = pile_of(v, what)?;
+    visit(st, &p, carry, what, &[])?;
+    Ok(resolve(st, p))
+}
+
+/// The hand goes to the pile's heap with a brush carrying `carry` of the last paint (board.rs
+/// `visit`): a heap scraped off is knifed again, which a full palette may refuse.
+fn visit(st: &S, p: &PileU, carry: f32, what: &str, parts: &[(usize, f32)]) -> Result<()> {
+    if p.heap == 0 {
+        return Ok(());
+    }
+    let s = &mut *st.borrow_mut();
+    if s.tubes.carried_paint {
+        if s.tubes.engine >= paint::PIGMENT_MIXER { s.board.visit_with9(p.heap, carry, parts) } else { s.board.visit_with(p.heap, carry, parts) }
+    } else { s.board.visit(p.heap, carry) }.map_err(|crate::board::Full| mlua::Error::runtime(s.board.full(&s.tubes, &format!("{what}: that pile was scraped off, and knifing it again needs room"))))
+}
+
+/// The pile as its heap is on the board now.
+pub(crate) fn resolve(st: &S, p: PileU) -> PileU {
+    if p.heap == 0 {
+        return p;
+    }
+    let s = st.borrow();
+    let Some(h) = s.board.heap(p.heap) else { return p };
+    if !h.changed {
+        return p;
+    }
+    let (fr, medium, solvent, oil_rate, thinner) = (h.fractions(), h.medium, h.solvent, h.oil_rate, h.thinner);
+    let parts = h.parts.iter().map(|&(i, v)| (s.tubes.tubes[i].name.to_string(), v * h.given_sum)).collect();
+    let mut mix = s.tubes.pile(fr);
+    mix.solvent = solvent;
+    mix.oil_rate = oil_rate;
+    PileU { mix, medium, parts, thinner: p.thinner.map(|_| thinner), ..p }
+}
+
+/// Knife a new heap on the board (board.rs `knife`), which a full palette may refuse.
+#[allow(clippy::too_many_arguments)]
+fn knife(st: &S, parts: Vec<(usize, f32)>, given_sum: f32, medium: f32, solvent: f32, oil_rate: f32, name: Option<String>, what: &str) -> Result<u64> {
+    let s = &mut *st.borrow_mut();
+    s.board.knife(parts, given_sum, medium, solvent, oil_rate, name).map_err(|crate::board::Full| mlua::Error::runtime(s.board.full(&s.tubes, what)))
+}
+
+/// Tubes in parts as given, `{{"tube name", parts}, ...}`, not normalised.
+fn tube_parts(tubes: &Palette, t: &Table, what: &str) -> Result<Vec<(usize, f32)>> {
+    let mut out: Vec<(usize, f32)> = Vec::new();
+    for e in t.sequence_values::<Value>() {
+        let Value::Table(e) = e? else { return err(format!("{what}: each part is {{\"tube name\", parts}}")) };
+        let name: String = e.get::<Option<String>>(1)?.ok_or_else(|| mlua::Error::runtime(format!("{what}: each part is {{\"tube name\", parts}}")))?;
+        let k: f32 = e.get::<Option<f32>>(2)?.ok_or_else(|| mlua::Error::runtime(format!("{what}: {name:?} needs a number of parts")))?;
+        if !(k > 0.0 && k.is_finite()) {
+            return err(format!("{what}: {name:?}: parts > 0"));
+        }
+        let i = tubes.tubes.iter().position(|t| t.name == name).ok_or_else(|| mlua::Error::runtime(format!("{what}: no tube {name:?}")))?;
+        match out.iter_mut().find(|p| p.0 == i) {
+            Some(p) => p.1 += k,
+            None => out.push((i, k)),
+        }
+    }
+    if out.is_empty() {
+        return err(format!("{what}: needs at least one tube"));
+    }
+    Ok(out)
+}
+
+/// A limited palette: only the tubes set out can be knifed.
+fn check_set_out(st: &S, parts: &[(usize, f32)], what: &str) -> Result<()> {
+    let s = st.borrow();
+    if let Some(set) = &s.board.set_out
+        && let Some(&(i, _)) = parts.iter().find(|p| !set.contains(&p.0))
+    {
+        return err(format!("{what}: {:?} isn't set out on the palette (palette{{set_out={{...}}}} sets out the tubes)", s.tubes.tubes[i].name));
+    }
+    Ok(())
+}
+
+/// Paint for one brushload from a pile: the pile, remixed a little (a pile
+/// knifed by hand is uneven), and the pile's color (for the palette ledger).
+fn brushload(st: &S, p: &Value, extra: &Value, what: &str, carry: f32, parts: &[(usize, f32)]) -> Result<(paint::Paint, Rgb)> {
+    // a legacy canvas's brushes load colors (legacy.rs)
+    if let Some(r) = crate::legacy::brushload(st, p, extra)? {
+        return Ok(r);
+    }
+    if !extra.is_nil() {
+        return err(format!("b:{what}(pile, amount): a pile carries its own medium; mix another pile for other paint"));
+    }
+    let p = pile_of(p, &format!("b:{what}"))?;
+    visit(st, &p, carry, &format!("b:{what}"), parts)?;
+    let p = resolve(st, p);
+    let sty = style(st)?;
+    let mut s = st.borrow_mut();
+    let tubes = s.tubes.clone();
+    let seed = s.rng.next_u64();
+    let m = tubes.remix(&p.mix, sty.mix_jitter, &mut Rng::new(seed));
+    Ok((thinned(m.laid(p.medium), p.thinner()), p.mix.color))
+}
+
+// ---------------------------------------------------------------- masks
+
+#[derive(Clone)]
+pub struct M(pub Rc<Mask>);
+
+pub(crate) fn mask_of(v: &Value) -> Result<Rc<Mask>> {
+    match v {
+        Value::UserData(u) if u.is::<M>() => Ok(u.borrow::<M>()?.0.clone()),
+        o => err(format!("want a mask, got {}; use rect(100,100,200,200) or convert a drawn outline with o:mask() (closed), o:below()/o:above() (open), or o:band(10). Call the method: o.mask is not a mask", o.type_name())),
+    }
+}
+pub(crate) fn paint_mask(st: &S, mut m: Rc<Mask>) -> Rc<Mask> {
+    if st.borrow().tubes.engine >= 9 && m.data.iter().any(|&v| v < 0.0 || v > 1.0) {
+        for v in &mut Rc::make_mut(&mut m).data {
+            *v = v.clamp(0.0, 1.0);
+        }
+    }
+    m
+}
+
+pub(crate) fn paint_mask_of(st: &S, v: &Value) -> Result<Rc<Mask>> {
+    Ok(paint_mask(st, mask_of(v)?))
+}
+
+fn mask_opt(st: &S, v: Value) -> Result<Option<Rc<Mask>>> {
+    match v {
+        Value::Nil => Ok(None),
+        v => paint_mask_of(st, &v).map(Some),
+    }
+}
+
+thread_local! {
+    /// The Lua state (to collect garbage) and the mask bytes made since the
+    /// last collection: Lua doesn't see how big a mask is (29 MB at 3200px),
+    /// so without this a loop of mask operations piles up gigabytes.
+    static GC: RefCell<(Option<mlua::WeakLua>, usize)> = const { RefCell::new((None, 0)) };
+}
+const GC_EVERY_BYTES: usize = 400 << 20;
+
+pub(crate) fn wrap(m: Mask) -> M {
+    note_bytes(m.data.len() * 4);
+    M(Rc::new(m))
+}
+
+/// Count memory handed to Lua values; collect garbage every `GC_EVERY_BYTES`.
+pub(crate) fn note_bytes(bytes: usize) {
+    let lua = GC.with(|g| {
+        let mut g = g.borrow_mut();
+        g.1 += bytes;
+        if g.1 > GC_EVERY_BYTES {
+            g.1 = 0;
+            g.0.as_ref().and_then(|w| w.try_upgrade())
+        } else {
+            None
+        }
+    });
+    if let Some(l) = lua {
+        let _ = l.gc_collect();
+    }
+}
+
+impl UserData for M {
+    fn add_methods<M_: UserDataMethods<Self>>(m: &mut M_) {
+        m.add_method("blur", |_, a, r: f32| Ok(wrap((*a.0).clone().blur(r))));
+        // m:roughen(units, period?, seed?, edge?): the edge moves in and out
+        // by up to about `units` (noise of `period` units), ramping over `edge`
+        m.add_method("roughen", |_, a, (amount, period, seed, edge): (f32, Option<f32>, Option<u32>, Option<f32>)| {
+            Ok(wrap((*a.0).clone().roughen(seed.unwrap_or(1), period.unwrap_or(40.0), amount, edge.unwrap_or(0.0))))
+        });
+        // m:soften(units): a soft edge that many units wide
+        m.add_method("soften", |lua, a, w: f32| {
+            let graded = lua.app_data_ref::<S>().is_some_and(|st| st.borrow().tubes.blend_at_masks);
+            Ok(wrap(if graded { a.0.soften_graded(move |_, _| w) } else { a.0.soften(move |_, _| w) }))
+        });
+        m.add_method("offset", |_, a, d: f32| Ok(wrap(a.0.offset(d))));
+        m.add_method("grow", |_, a, d: f32| Ok(wrap(a.0.dilate(d))));
+        m.add_method("shrink", |_, a, d: f32| Ok(wrap(a.0.erode(d))));
+        m.add_method("rim", |_, a, (w, soft): (f32, Option<f32>)| Ok(wrap(a.0.rim(w, soft.unwrap_or(1.0)))));
+        m.add_method("band", |_, a, (lo, hi, soft): (f32, f32, Option<f32>)| Ok(wrap((*a.0).clone().band(lo, hi, soft.unwrap_or(1.0)))));
+        m.add_method("distance", |_, a, ()| Ok(wrap(a.0.distance())));
+        m.add_method("invert", |_, a, ()| Ok(wrap((*a.0).clone().invert())));
+        m.add_method("at", |_, a, (x, y): (f32, f32)| Ok(a.0.sample(x, y)));
+        m.add_method("area", |_, a, ()| {
+            let s = a.0.f.scale;
+            Ok(a.0.data.iter().map(|&v| v as f64).sum::<f64>() / (s as f64 * s as f64))
+        });
+        // m:times(fn(x, y) or mask), m:map(fn(v))
+        m.add_method("times", |_, a, g: Value| match g {
+            Value::Function(f) => Ok(wrap((*a.0).clone().mul(&eval_mask(a.0.f, &f)?))),
+            v => Ok(wrap((*a.0).clone().mul(&*mask_of(&v)?))),
+        });
+        m.add_method("map", |_, a, f: Function| {
+            let mut out = (*a.0).clone();
+            for v in out.data.iter_mut() {
+                *v = f.call(*v)?;
+            }
+            Ok(wrap(out))
+        });
+        m.add_meta_method(MetaMethod::Add, |_, a, b: Value| Ok(wrap((*a.0).clone().union(&*mask_of(&b)?))));
+        m.add_meta_method(MetaMethod::Mul, |_, a, b: Value| Ok(wrap((*a.0).clone().mul(&*mask_of(&b)?))));
+        m.add_meta_method(MetaMethod::Sub, |_, a, b: Value| Ok(wrap((*a.0).clone().subtract(&*mask_of(&b)?))));
+        m.add_meta_method(MetaMethod::Unm, |_, a, ()| Ok(wrap((*a.0).clone().invert())));
+        m.add_meta_method(MetaMethod::ToString, |_, a, ()| {
+            let s = a.0.f.scale;
+            let area = a.0.data.iter().map(|&v| v as f64).sum::<f64>() / (s as f64 * s as f64);
+            Ok(format!("mask({area:.0} sq units)"))
+        });
+    }
+}
+
+/// A painter's mask function at every pixel center (serial: Lua).
+fn eval_mask(f: Frame, g: &Function) -> Result<Mask> {
+    let mut data = vec![0.0f32; f.w * f.h];
+    let inv = 1.0 / f.scale;
+    for y in 0..f.h {
+        let yu = (y as f32 + 0.5) * inv;
+        for x in 0..f.w {
+            let v: f32 = g.call(((x as f32 + 0.5) * inv, yu))?;
+            data[y * f.w + x] = v.clamp(0.0, 1.0);
+        }
+    }
+    Ok(Mask { f, data })
+}
+
+pub(crate) fn curve_of(v: &Value, w: f32) -> Result<Vec<(f32, f32)>> {
+    match v {
+        Value::Function(f) => {
+            let n = 250;
+            (0..=n).map(|i| {
+                let x = w * i as f32 / n as f32;
+                Ok((x, f.call::<f32>(x)?))
+            }).collect()
+        }
+        Value::Table(_) => points(v),
+        v => err(format!("the curve: want points {{{{x, y}}, ...}} or {{x1, y1, x2, y2, ...}}, or a function(x) giving y; got {}", v.type_name())),
+    }
+}
+
+// ---------------------------------------------------------------- noise
+
+#[derive(Clone, Copy)]
+pub enum NoiseKind {
+    Fbm(Fbm),
+    Octaves(paint::noise::Octaves),
+}
+
+/// A noise field: fBm, ridged or billowed octaves, optionally seen through
+/// a domain warp and stretched along a direction.
+#[derive(Clone, Copy)]
+pub struct Noise {
+    kind: NoiseKind,
+    warp: Option<paint::noise::Warp>,
+    stretch: Option<paint::noise::Aniso>,
+}
+
+impl Noise {
+    fn get(&self, x: f32, y: f32) -> f32 {
+        let (mut x, mut y) = (x, y);
+        if let Some(a) = &self.stretch {
+            (x, y) = a.at(x, y);
+        }
+        if let Some(w) = &self.warp {
+            (x, y) = w.at(x, y);
+        }
+        match &self.kind {
+            NoiseKind::Fbm(f) => f.get(x, y),
+            NoiseKind::Octaves(o) => o.get(x, y),
+        }
+    }
+    fn get01(&self, x: f32, y: f32) -> f32 {
+        match (&self.kind, &self.warp, &self.stretch) {
+            (NoiseKind::Fbm(f), None, None) => f.get01(x, y),
+            _ => (self.get(x, y) * 0.5 + 0.5).clamp(0.0, 1.0),
+        }
+    }
+}
+
+impl UserData for Noise {
+    fn add_methods<M: UserDataMethods<Self>>(m: &mut M) {
+        m.add_meta_method(MetaMethod::Call, |_, n, (x, y): (f32, f32)| Ok(n.get(x, y)));
+        m.add_method("at", |_, n, (x, y): (f32, f32)| Ok(n.get(x, y)));
+        m.add_method("at01", |_, n, (x, y): (f32, f32)| Ok(n.get01(x, y)));
+    }
+}
+
+pub struct WorleyU(paint::noise::Worley);
+impl UserData for WorleyU {
+    fn add_methods<M: UserDataMethods<Self>>(m: &mut M) {
+        // c:at(x, y) -> f1, f2, edge, rand: distances to the nearest two cell
+        // points (units), how near a cell edge (0 on it), and a stable 0..1 per cell
+        m.add_method("at", |_, w, (x, y): (f32, f32)| {
+            let c = w.0.get(x, y);
+            Ok((c.f1, c.f2, c.edge(), c.rand()))
+        });
+        m.add_meta_method(MetaMethod::Call, |_, w, (x, y): (f32, f32)| Ok(w.0.get(x, y).f1));
+    }
+}
+
+// ---------------------------------------------------------------- handling
+
+const WORK_KEYS: &[&str] = &[
+    "hand", "pile", "tool", "length", "coverage", "angle", "angle_jitter", "load_at", "cut_in", "pressure", "orient", "dips", "blender", "scrub", "clip",
+    "threshold", "ramps", "shake", "curve", "cross", "drift", "tail", "broken", "swell", "clump", "order", "mix_jitter", "seed", "ruler", "load", "hug",
+    "fill", "visible", "behind", "at", "view", "edge", "streak", "second", "scale_at", "piles",
+];
+
+/// How far from the canvas's corner a gesture's point may lie (units; the
+/// canvas is 1000 wide and at most 5000 high).
+const GESTURE_REACH: f32 = 20_000.0;
+
+const PART_KEYS: &[&str] = &["side", "share", "streak"];
+
+/// A load's amount (a share of a full load; `default` if none is given): a
+/// number, not an infinity or a NaN, which would leave the tool's paint NaN.
+fn load_amount(amount: Option<f32>, default: f32, what: &str) -> Result<f32> {
+    match amount {
+        None => Ok(default),
+        Some(a) if a.is_finite() => Ok(a),
+        Some(a) => err(format!("{what}: the amount is a share of a full load (0..1), not {a}")),
+    }
+}
+
+/// The part of a brush a dip reaches: `{side=-1..1, share=0..1, streak=0..1}`.
+fn part_of(t: &Table, what: &str) -> Result<paint::Part> {
+    let side = num(&t, "side")?.unwrap_or(0.0);
+    let share = num(&t, "share")?.unwrap_or(if side != 0.0 { 0.5 } else { 1.0 });
+    let streak = num(&t, "streak")?.unwrap_or(0.0);
+    if !(-1.0..=1.0).contains(&side) || !(0.0..=1.0).contains(&share) || !(0.0..=1.0).contains(&streak) {
+        return err(format!("{what}: side is -1..1 (which edge of the brush goes in), share 0..1 (how much of its width), streak 0..1 (how unevenly)"));
+    }
+    Ok(paint::Part { side, share, streak, seed: 0 })
+}
+
+const EDGE_KEYS: &[&str] = &["found", "soft", "lost", "period", "seed", "quality", "waver", "reach"];
+
+/// A named edge quality (0 found .. 1 lost).
+fn edge_name(s: &str) -> Result<f32> {
+    Ok(match s {
+        "found" | "crisp" | "hard" => 0.0,
+        "firm" => 0.25,
+        "soft" => 0.5,
+        "loose" => 0.75,
+        "lost" => 1.0,
+        o => return err(format!("edge {o:?}: \"found\", \"firm\", \"soft\", \"loose\" or \"lost\" (or a number 0..1, a function, a mask or a table)")),
+    })
+}
+
+/// The quality field of `edge=` as a whole-canvas mask (0 found .. 1 lost).
+pub(crate) fn edge_quality(st: &S, v: &Value, region: &Mask, b: (f32, f32, f32, f32), seed: u64) -> Result<Mask> {
+    let f = region.f;
+    match v {
+        Value::String(s) => {
+            let q = edge_name(&s.to_str()?)?;
+            Ok(Mask::from_fn(f, move |_, _| q))
+        }
+        Value::UserData(u) if u.borrow::<M>().is_ok() => Ok((*paint_mask_of(st, v)?).clone()),
+        Value::Table(t) => {
+            check_keys(t, EDGE_KEYS, "edge")?;
+            if let Some(q) = t.get::<Option<Value>>("quality")? {
+                return edge_quality(st, &q, region, b, seed);
+            }
+            let (fo, so, lo) = (num(&t, "found")?.unwrap_or(0.0), num(&t, "soft")?.unwrap_or(0.0), num(&t, "lost")?.unwrap_or(0.0));
+            if !(fo >= 0.0 && so >= 0.0 && lo >= 0.0) || fo + so + lo <= 0.0 {
+                return err("edge={found=, soft=, lost=}: shares of the contour, at least one above 0");
+            }
+            let period = num(&t, "period")?.unwrap_or(40.0);
+            let sd = t.get::<Option<u64>>("seed")?.unwrap_or(seed);
+            Ok(paint::fence::stretches(region, (fo, so, lo), period, 6.0, sd))
+        }
+        v => {
+            let g = scalar_field(st, v, b, "edge")?;
+            Ok(Mask::from_fn(f, move |x, y| g(x, y).clamp(0.0, 1.0)))
+        }
+    }
+}
+
+fn work(st: &S, mask: Rc<Mask>, o: Table, preset: Option<&str>) -> Result<()> {
+    check_keys(&o, &crate::legacy::work_keys(st, WORK_KEYS), "work")?;
+    let mask = paint_mask(st, mask);
+    let region = mask.clone();
+    let (mask, limit) = crate::depth::restrict_mask(st, &o, mask)?;
+    let sty = style(st)?;
+    let f = frame(st)?;
+    let hand: String = o.get::<Option<String>>("hand")?.unwrap_or_else(|| preset.unwrap_or("body").to_string());
+    let blending = hand == "blend" || o.get::<Option<bool>>("blender")?.unwrap_or(false);
+    // piles={{pile, weight}, ...}: graded color, each weight a number or function(x, y)
+    let graded: Option<Vec<(PileU, Value)>> = match o.get::<Option<Table>>("piles")? {
+        None => None,
+        Some(t) => {
+            let mut v = Vec::new();
+            for e in t.sequence_values::<Table>() {
+                let e = e?;
+                // (a weight that is no number is refused, not quietly counted as none)
+                let w = e.get::<Value>(2)?;
+                if let Value::Number(n) = &w
+                    && !n.is_finite()
+                {
+                    return err(format!("work piles: a weight is a number or function(x, y), not {n}"));
+                }
+                v.push((pass_pile(st, &e.get::<Value>(1)?, "work piles")?, w));
+            }
+            if v.len() < 2 {
+                return err("work: piles={{pile, weight}, {pile, weight}, ...} takes two or more piles");
+            }
+            Some(v)
+        }
+    };
+    let pile = match o.get::<Value>("pile")? {
+        Value::Nil if graded.is_some() => Some(graded.as_ref().unwrap()[0].0.clone()),
+        Value::Nil if blending => None,
+        // a legacy canvas's passes paint colors (legacy.rs)
+        Value::Nil if crate::legacy::on(st) => None,
+        v => Some(pass_pile(st, &v, "work")?),
+    };
+    let tubes = st.borrow().tubes.clone();
+    let mut h: Handling = match hand.as_str() {
+        "broad" => sty.broad(),
+        "body" => sty.body(),
+        "detail" => sty.detail(),
+        "hatch" => sty.hatch(),
+        "glaze" => sty.glaze(),
+        "scumble" => sty.scumble(),
+        "blend" => sty.blend().ok_or_else(|| mlua::Error::runtime("this style has no blender"))?,
+        o => return err(format!("hand {o:?}: broad, body, detail, hatch, glaze, scumble or blend")),
+    };
+    // a painting with the glaze film: the glaze and the scumble lay a thin
+    // film, their coverage the share of the mask it reaches
+    if st.borrow().canvas.as_ref().is_some_and(|c| c.glaze_film()) {
+        match hand.as_str() {
+            "glaze" => h = h.film(paint::Style::GLAZE_FILM),
+            "scumble" => h = h.film(paint::Style::SCUMBLE_FILM),
+            _ => {}
+        }
+    }
+    if let Some(t) = o.get::<Option<Value>>("tool")? {
+        h.tool = tool_of(st, &t)?;
+    }
+    let len = h.length.1.max(h.length.0);
+    if let Some((a, b)) = pair(&o, "length")? {
+        h = h.length(a, b);
+    }
+    let pad = h.length.1.max(len) + h.tool.width * 2.0;
+    let (b, feedback_bounds) = support_with_pixels(Some(&mask), f, pad);
+    if let Some(c) = num(&o, "coverage")? {
+        h = h.coverage(c);
+    }
+    if let Some(v) = o.get::<Option<Value>>("angle")? {
+        h.angle = angle_field(st, &v, b)?;
+    }
+    if let Some(a) = num(&o, "angle_jitter")? {
+        h = h.angle_jitter(a);
+    }
+    if let Some(on) = o.get::<Option<bool>>("hug")? {
+        h = h.hug(on);
+    }
+    if let Some(p) = &pile {
+        h = h.piled(&tubes, p.mix.clone(), p.medium).thinner(p.thinner());
+    }
+    // streak=: each dip taken up unevenly, in streaks across the brush
+    if let Some(v) = num(&o, "streak")? {
+        if !(0.0..=1.0).contains(&v) {
+            return err("work: streak is 0..1 (how unevenly each dip loads the brush)");
+        }
+        h.part = paint::Part { streak: v, ..paint::Part::ALL };
+    }
+    // second={pile=, load=, side=, share=, streak=}: then part of the brush in a second pile
+    let mut second_pile = None;
+    if let Some(t) = o.get::<Option<Table>>("second")? {
+        check_keys(&t, &["pile", "load", "side", "share", "streak"], "work second")?;
+        if pile.is_none() {
+            return err("work: second= is a second dip after the pile's; give pile= too");
+        }
+        let p2 = pass_pile(st, &t.get::<Value>("pile")?, "work second")?;
+        let part = part_of(&t, "work second")?;
+        let load = load_amount(num(&t, "load")?, 0.4, "work second")?;
+        h.second = Some(paint::handling::Second { palette: &tubes, pile: p2.mix.clone(), medium: p2.medium, thinner: p2.thinner(), load, part });
+        second_pile = Some(p2);
+    }
+    if pile.is_none() && crate::legacy::on(st) {
+        crate::legacy::work(st, &o, &mut h, &hand, blending, b)?;
+    }
+    if let Some(on) = o.get::<Option<bool>>("fill")? {
+        h = h.fill(on);
+    }
+    if let Some(v) = o.get::<Option<Value>>("load_at")? {
+        h.load_at = Some(scalar_field(st, &v, b, "load_at")?);
+    }
+    // scale_at=: the size of the marks across the area (a number or function(x, y)
+    // multiplying stroke length and brush width; more strokes where they are smaller)
+    if let Some(g) = &graded {
+        let mut ps = Vec::new();
+        for (p, w) in g {
+            let f: FieldBox<f32> = match w {
+                Value::Nil => return err("work piles: each entry is {pile, weight} (a number or function(x, y))"),
+                w => scalar_field(st, w, b, "work piles weight")?,
+            };
+            ps.push((p.mix.clone(), p.medium, p.thinner(), f));
+        }
+        h.piles_at = Some(ps);
+    }
+    if let Some(v) = o.get::<Option<Value>>("scale_at")? {
+        h.scale_at = Some(scalar_field(st, &v, b, "scale_at")?);
+    }
+    if let Some(t) = o.get::<Option<Value>>("cut_in")? {
+        h = h.cut_in(tool_of(st, &t)?);
+    }
+    if let Some((a, z)) = pair(&o, "pressure")? {
+        h = h.pressure(a, z);
+    }
+    if let Some(or) = orient_of(o.get("orient")?)? {
+        h = h.orient(or);
+    }
+    if let Some(d) = o.get::<Option<Table>>("dips")? {
+        let (e, l, w) = (d.get::<Option<usize>>(1)?.unwrap_or(h.dip_every), d.get::<Option<f32>>(2)?.unwrap_or(h.load), d.get::<Option<f32>>(3)?.unwrap_or(h.wipe));
+        h = h.dips(e, l, w);
+    }
+    if let Some(l) = num(&o, "load")? {
+        h = h.load(l);
+    }
+    if o.get::<Option<bool>>("blender")?.unwrap_or(false) {
+        h = h.blender();
+    }
+    if let Some(n) = o.get::<Option<usize>>("scrub")? {
+        h = h.scrub(n);
+    }
+    let (clip, limit) = clip_opt(st, &o, limit)?;
+    if let Some(c) = clip {
+        h = h.clip(c);
+    }
+    if let Some(t) = num(&o, "threshold")? {
+        h = h.threshold(t);
+    }
+    if let Some((a, r)) = pair(&o, "ramps")? {
+        h = h.ramps(a, r);
+    }
+    if let Some(s) = num(&o, "shake")? {
+        h = h.shake(s);
+    }
+    // (drawn once, here: edge= must not change the pass's strokes)
+    let pass_seed = seed_of(st, &o)?;
+    // edge=: carry the passage to the region's edge as a brush does (found, soft, lost)
+    let edge_v = o.get::<Value>("edge")?;
+    if !edge_v.is_nil() {
+        if h.cut_in.is_some() {
+            return err("work: edge= and cut_in= both say how the edge is made; give one");
+        }
+        let seed = pass_seed ^ 0xED6E_F00D;
+        let q = edge_quality(st, &edge_v, &mask, b, seed)?;
+        let (waver, reach) = match &edge_v {
+            Value::Table(t) => (num(&t, "waver")?.unwrap_or(1.0), num(&t, "reach")?.unwrap_or(1.0)),
+            _ => (1.0, 1.0),
+        };
+        let fence = paint::fence::Fence::new(&mask, &q, h.tool.width, waver, reach, seed);
+        h = h.fence(std::sync::Arc::new(fence));
+    }
+    if o.get::<Option<bool>>("ruler")?.unwrap_or(false) {
+        h = h.ruler();
+    }
+    match o.get::<Value>("curve")? {
+        Value::Nil => {}
+        Value::Table(t) => {
+            let (bow, wave) = (t.get(1)?, t.get::<Option<f32>>(2)?.unwrap_or(h.wave));
+            h = h.curve(bow, wave)
+        }
+        v => {
+            let (bow, wave) = (f32::from_lua_value(v)?, h.wave);
+            h = h.curve(bow, wave)
+        }
+    }
+    if let Some(c) = num(&o, "cross")? {
+        h = h.cross(c);
+    }
+    if let Some((a, s)) = pair(&o, "drift")? {
+        h = h.drift(a, s);
+    }
+    if let Some(t) = num(&o, "tail")? {
+        h = h.tail(t);
+    }
+    if let Some(t) = num(&o, "broken")? {
+        h = h.broken(t);
+    }
+    if let Some(t) = num(&o, "swell")? {
+        h = h.swell(t);
+    }
+    if let Some(t) = num(&o, "clump")? {
+        h = h.clump(t);
+    }
+    if let Some(t) = num(&o, "mix_jitter")? {
+        h = h.mix_jitter(t);
+    }
+    match o.get::<Value>("order")? {
+        Value::Nil => {}
+        Value::String(s) => {
+            h = h.order(match &*s.to_str()? {
+                "passages" => Order::Passages,
+                "scatter" => Order::Scatter,
+                "down" => Order::Sweep(std::f32::consts::FRAC_PI_2),
+                "across" => Order::Sweep(0.0),
+                o => return err(format!("order {o:?}: \"passages\", \"scatter\", \"down\", \"across\" or a sweep angle")),
+            })
+        }
+        v => h = h.sweep(f32::from_lua_value(v)?),
+    }
+    // an unclipped blender or glaze carries past its mask by half a brush (as
+    // the marks are sized there), not by a stroke's length (a clip mask of the
+    // painter's own says how far); what is in front still limits it, once
+    let limit = if st.borrow().tubes.blend_at_masks && !h.clip && (blending || hand == "glaze") && !matches!(o.get::<Value>("clip")?, Value::UserData(_)) {
+        let (half, hd) = (h.tool.width * 0.5, &h);
+        let reach = region.reach(|x, y| half * hd.scale_here(f, x, y));
+        Some(std::sync::Arc::new(match limit {
+            Some(l) => reach.mul(&l),
+            None => reach,
+        }))
+    } else {
+        limit
+    };
+    if let Some(l) = limit {
+        h = h.limit(l);
+    }
+    h.tool.validate().map_err(mlua::Error::runtime)?;
+    let seed = pass_seed;
+    let board = std::sync::Arc::new(std::sync::Mutex::new(st.borrow().board.clone()));
+    if tubes.carried_paint && st.borrow().board.dirty > 0.0 && !h.blender && pile.is_some() {
+        let mut sources: Vec<_> = match &graded {
+            Some(ps) => ps.iter().map(|(p, _)| p.clone()).collect(),
+            None => Vec::new(),
+        };
+        sources.extend(pile.iter().cloned());
+        sources.extend(second_pile);
+        h.dip_with = Some(pass_dips(board.clone(), (*tubes).clone(), sources, h.mix_jitter));
+    }
+    let (options, feedback_clip) = feedback_options(&o)?;
+    // (dipping into the piles on the palette)
+    time::verb(st, Verb::Pass, |s| {
+        crate::pass_feedback::drying_pass(s, &mask, feedback_clip.as_deref(), feedback_bounds, if preset == Some("blend") { "blend" } else { "work" });
+        let c = s.canvas.as_mut().ok_or_else(no_canvas)?;
+        let before = c.tally();
+        c.work_with(&mut s.hand.piles, &mask, &h, seed);
+        let made = c.tally().since(&before);
+        crate::pass_feedback::pass(s, &region, &mask, feedback_clip.as_deref(), &options, if preset == Some("blend") { "blend" } else { "work" }, made.strokes + made.touches);
+        if h.dip_with.is_some() {
+            s.board = board.lock().unwrap().clone();
+        }
+        Ok(())
+    })
+}
+
+fn pass_pile(st: &S, value: &Value, what: &str) -> Result<PileU> {
+    if !st.borrow().tubes.carried_paint {
+        return pile_now(st, value, what, 0.5);
+    }
+    let p = pile_of(value, what)?;
+    if p.heap != 0 {
+        let mut s = st.borrow_mut();
+        s.board.reknife(p.heap).map_err(|crate::board::Full| mlua::Error::runtime(s.board.full(&s.tubes, &format!("{what}: that pile was scraped off, and knifing it again needs room"))))?;
+    }
+    Ok(resolve(st, p))
+}
+
+fn pass_dips(board: std::sync::Arc<std::sync::Mutex<crate::board::Board>>, tubes: Palette, piles: Vec<PileU>, jitter: f32) -> paint::handling::Dip<'static> {
+    let sources: Vec<_> = piles.into_iter().map(|p| (p.heap, p.mix.clone(), p.medium, p.thinner())).collect();
+    Box::new(move |held, weights, seed| {
+        let mut board = board.lock().unwrap();
+        let carry = held.carried_parts();
+        let mut resolved = Vec::new();
+        for &(source, weight) in weights {
+            let (id, original, medium, thinner) = &sources[source];
+            if tubes.engine >= paint::PIGMENT_MIXER { board.visit_with9(*id, held.fullness().min(1.0), &carry) } else { board.visit_with(*id, held.fullness().min(1.0), &carry) }.expect("pass heaps were prepared before painting");
+            let (mix, medium, thinner) = match board.heap(*id) {
+                Some(heap) if heap.changed => {
+                    let mut mix = tubes.pile(heap.fractions());
+                    mix.solvent = heap.solvent;
+                    mix.oil_rate = heap.oil_rate;
+                    (mix, heap.medium, heap.thinner)
+                }
+                _ => (original.clone(), *medium, *thinner),
+            };
+            resolved.push((mix, medium, thinner, weight));
+        }
+        let (mix, medium, thinner) = if resolved.len() == 1 {
+            let (mix, medium, thinner, _) = resolved.pop().unwrap();
+            (mix, medium, thinner)
+        } else {
+            let mut parts: Vec<(usize, f32)> = Vec::new();
+            let (mut medium, mut thinner, mut solvent, mut oil_rate) = (0.0, 0.0, 0.0, 0.0);
+            for (mix, md, th, weight) in resolved {
+                let sum = mix.parts.iter().map(|p| p.1).sum::<f32>().max(1e-9);
+                for (i, fraction) in mix.parts {
+                    match parts.iter_mut().find(|p| p.0 == i) {
+                        Some(p) => p.1 += weight * fraction / sum,
+                        None => parts.push((i, weight * fraction / sum)),
+                    }
+                }
+                medium += weight * md;
+                thinner += weight * th;
+                solvent += weight * mix.solvent;
+                oil_rate += weight * mix.oil_rate;
+            }
+            let mut mix = tubes.pile(parts);
+            mix.solvent = solvent;
+            mix.oil_rate = oil_rate;
+            (mix, medium, thinner)
+        };
+        thinned(tubes.remix(&mix, jitter, &mut Rng::new(seed)).laid(medium), thinner)
+    })
+}
+
+pub(crate) trait FromLuaValue: Sized {
+    fn from_lua_value(v: Value) -> Result<Self>;
+}
+impl FromLuaValue for f32 {
+    fn from_lua_value(v: Value) -> Result<f32> {
+        match v {
+            Value::Number(n) => Ok(n as f32),
+            Value::Integer(n) => Ok(n as f32),
+            o => err(format!("want a number, got {}", o.type_name())),
+        }
+    }
+}
+
+fn feedback_options(o: &Table) -> Result<(String, Option<Rc<Mask>>)> {
+    let mut names = Vec::new();
+    let mut clip = None;
+    for key in ["visible", "behind", "at", "clip"] {
+        let v = o.raw_get::<Value>(key)?;
+        if !v.is_nil() && (key != "clip" || matches!(v, Value::UserData(_))) {
+            names.push(format!("{key}="));
+            if key == "clip" {
+                clip = Some(mask_of(&v)?);
+            }
+        }
+    }
+    Ok((names.join("/"), clip))
+}
+
+/// `clip=` on a pass: true, false, or a mask the strokes are clipped to,
+/// soft edges and all (the deposit is scaled by the mask's value), combined
+/// with any limit from `behind=`/`at=`.
+fn clip_opt(st: &S, o: &Table, limit: Option<std::sync::Arc<Mask>>) -> Result<(Option<bool>, Option<std::sync::Arc<Mask>>)> {
+    match o.get::<Value>("clip")? {
+        Value::Nil => Ok((None, limit)),
+        Value::Boolean(b) => Ok((Some(b), limit)),
+        Value::UserData(u) if u.borrow::<M>().is_ok() => {
+            let m = (*paint_mask(st, u.borrow::<M>()?.0.clone())).clone();
+            let m = match limit {
+                Some(l) => m.mul(&l),
+                None => m,
+            };
+            Ok((Some(false), Some(std::sync::Arc::new(m))))
+        }
+        v => err(format!("clip= is true, false or a mask, got {}", v.type_name())),
+    }
+}
+
+pub(crate) fn seed_of(st: &S, o: &Table) -> Result<u64> {
+    Ok(match o.get::<Option<u64>>("seed")? {
+        Some(s) => s,
+        None => st.borrow_mut().auto_seed(),
+    })
+}
+
+const STIPPLE_KEYS: &[&str] = &[
+    "tool", "width", "pile", "pressure", "coverage", "dips", "drag", "twist", "cluster", "feather", "clip", "mix_jitter", "seed", "visible", "behind", "at", "view",
+];
+
+fn stipple(st: &S, mask: Rc<Mask>, o: Table) -> Result<()> {
+    check_keys(&o, &crate::legacy::stipple_keys(st, STIPPLE_KEYS), "stipple")?;
+    let mask = paint_mask(st, mask);
+    let region = mask.clone();
+    let (mask, limit) = crate::depth::restrict_mask(st, &o, mask)?;
+    let f = frame(st)?;
+    let tool = match o.get::<Option<Value>>("tool")? {
+        Some(t) => tool_of(st, &t)?,
+        None => Tool::stippler(num(&o, "width")?.unwrap_or(2.0)),
+    };
+    let (b, feedback_bounds) = support_with_pixels(Some(&mask), f, tool.width * 2.0 + 4.0);
+    let tubes = st.borrow().tubes.clone();
+    // a legacy canvas stipples colors (legacy.rs)
+    let legacy = o.get::<Value>("pile")?.is_nil() && crate::legacy::on(st);
+    let mut source_pile = None;
+    let mut sp = if legacy {
+        Stipple::new(tool)
+    } else {
+        let pile = pass_pile(st, &o.get::<Value>("pile")?, "stipple")?;
+        source_pile = Some(pile.clone());
+        Stipple::new(tool).piled(&tubes, pile.mix.clone(), pile.medium).thinner(pile.thinner())
+    };
+    if legacy {
+        crate::legacy::stipple(st, &o, &mut sp, b)?;
+    }
+    // the touches' pressure is the painter's unless `feather` is asked for
+    sp = sp.feather(num(&o, "feather")?.unwrap_or(0.0));
+    if let Some(v) = o.get::<Option<Value>>("coverage")? {
+        sp.coverage = scalar_field(st, &v, b, "coverage")?;
+    }
+    if let Some((a, z)) = pair(&o, "pressure")? {
+        sp = sp.pressure(a, z);
+    }
+    if let Some(d) = o.get::<Option<Table>>("dips")? {
+        let (e, l, w) = (d.get::<Option<usize>>(1)?.unwrap_or(sp.dip_every), d.get::<Option<f32>>(2)?.unwrap_or(sp.load), d.get::<Option<f32>>(3)?.unwrap_or(sp.wipe));
+        sp = sp.dips(e, l, w);
+    }
+    match o.get::<Value>("drag")? {
+        Value::Nil => {}
+        Value::Table(t) => sp = sp.drag(t.get(1)?, t.get::<Option<f32>>(2)?),
+        v => sp = sp.drag(f32::from_lua_value(v)?, None),
+    }
+    if let Some(t) = num(&o, "twist")? {
+        sp = sp.twist(t);
+    }
+    match o.get::<Value>("cluster")? {
+        Value::Nil => {}
+        Value::Table(t) => sp = sp.cluster(t.get(1)?, t.get::<Option<f32>>(2)?),
+        v => sp = sp.cluster(f32::from_lua_value(v)?, None),
+    }
+    let (clip, limit) = clip_opt(st, &o, limit)?;
+    if let Some(c) = clip {
+        sp = sp.clip(c);
+    }
+    if let Some(j) = num(&o, "mix_jitter")? {
+        sp = sp.mix_jitter(j);
+    }
+    if let Some(l) = limit {
+        sp = sp.limit(l);
+    }
+    sp.tool.validate().map_err(mlua::Error::runtime)?;
+    let seed = seed_of(st, &o)?;
+    let board = std::sync::Arc::new(std::sync::Mutex::new(st.borrow().board.clone()));
+    if tubes.carried_paint && st.borrow().board.dirty > 0.0 {
+        if let Some(pile) = source_pile {
+            sp.dip_with = Some(pass_dips(board.clone(), (*tubes).clone(), vec![pile], sp.mix_jitter));
+        }
+    }
+    let (options, feedback_clip) = feedback_options(&o)?;
+    time::verb(st, Verb::Pass, |s| {
+        crate::pass_feedback::drying_pass(s, &mask, feedback_clip.as_deref(), feedback_bounds, "stipple");
+        let c = s.canvas.as_mut().ok_or_else(no_canvas)?;
+        let before = c.tally();
+        c.stipple_with(&mut s.hand.piles, &mask, &sp, seed);
+        let made = c.tally().since(&before);
+        crate::pass_feedback::pass(s, &region, &mask, feedback_clip.as_deref(), &options, "stipple", made.strokes + made.touches);
+        if sp.dip_with.is_some() {
+            s.board = board.lock().unwrap().clone();
+        }
+        Ok(())
+    })
+}
+
+
+/// The longest `wait` (minutes): 10 years of 365.25 days.
+const MAX_WAIT_MIN: f64 = 10.0 * 365.25 * 24.0 * 60.0;
+
+pub(crate) fn current_frame(lua: &Lua) -> Result<Frame> {
+    let st = lua.app_data_ref::<S>().ok_or_else(|| mlua::Error::runtime("no studio"))?;
+    frame(&st)
+}
+
+pub fn install(lua: &Lua, st: S) -> Result<()> {
+    lua.set_app_data(st.clone());
+    GC.with(|g| *g.borrow_mut() = (Some(lua.weak()), 0));
+    let g = lua.globals();
+
+    // output goes to the chunk's reply
+    {
+        let st = st.clone();
+        g.set(
+            "print",
+            lua.create_function(move |lua, args: Variadic<Value>| {
+                let tostring: Function = lua.globals().get("tostring")?;
+                let parts: Vec<String> = args.iter().map(|a| tostring.call::<String>(a.clone())).collect::<Result<_>>()?;
+                let mut s = st.borrow_mut();
+                s.out.push_str(&parts.join("\t"));
+                s.out.push('\n');
+                Ok(())
+            })?,
+        )?;
+    }
+
+    // deterministic randomness: reseeded per chunk from the canvas seed
+    {
+        let math: Table = g.get("math")?;
+        let s1 = st.clone();
+        math.set(
+            "random",
+            // Stock Lua 5.4's arguments and errors. Ranges up to 2^24 wide
+            // draw from one f32 as they always have (old logs replay the
+            // same); wider ones draw 64-bit integers.
+            lua.create_function(move |lua, args: Variadic<Value>| {
+                let int = |i: usize| -> Result<i64> {
+                    let v = args[i].clone();
+                    match lua.coerce_integer(v.clone())? {
+                        Some(k) => Ok(k),
+                        None if lua.coerce_number(v.clone())?.is_some() => {
+                            err(format!("bad argument #{} to 'random' (number has no integer representation)", i + 1))
+                        }
+                        None => err(format!("bad argument #{} to 'random' (number expected, got {})", i + 1, v.type_name())),
+                    }
+                };
+                let (m, n) = match args.len() {
+                    0 => return Ok(Value::Number(s1.borrow_mut().rng.f() as f64)),
+                    1 => match int(0)? {
+                        0 => return Ok(Value::Integer(s1.borrow_mut().rng.next_u64() as i64)),
+                        n => (1, n),
+                    },
+                    2 => (int(0)?, int(1)?),
+                    _ => return err("wrong number of arguments to 'random'"),
+                };
+                if m > n {
+                    return err("bad argument #1 to 'random' (interval is empty)");
+                }
+                let rng = &mut s1.borrow_mut().rng;
+                let lim = n.wrapping_sub(m) as u64;
+                if lim < 1 << 24 {
+                    let w = lim as i64 + 1;
+                    let r = rng.f() as f64;
+                    return Ok(Value::Integer(m + ((r * w as f64).floor() as i64).min(w - 1)));
+                }
+                // uniform in 0..=lim: draw under the smallest all-ones mask, retry above lim
+                let mask = u64::MAX >> lim.leading_zeros();
+                let x = loop {
+                    let x = rng.next_u64() & mask;
+                    if x <= lim {
+                        break x;
+                    }
+                };
+                Ok(Value::Integer((m as u64).wrapping_add(x) as i64))
+            })?,
+        )?;
+        let s2 = st.clone();
+        math.set("randomseed", lua.create_function(move |_, s: u64| {
+            s2.borrow_mut().rng = Rng::new(s);
+            Ok(())
+        })?)?;
+        let s3 = st.clone();
+        g.set("rand", lua.create_function(move |_, (a, b): (Option<f32>, Option<f32>)| {
+            let mut s = s3.borrow_mut();
+            Ok(match (a, b) {
+                (None, _) => s.rng.f(),
+                (Some(hi), None) => s.rng.range(0.0, hi),
+                (Some(lo), Some(hi)) => s.rng.range(lo, hi),
+            })
+        })?)?;
+        let s4 = st.clone();
+        g.set("randn", lua.create_function(move |_, (mean, sd): (Option<f32>, Option<f32>)| {
+            Ok(mean.unwrap_or(0.0) + sd.unwrap_or(1.0) * s4.borrow_mut().rng.normal())
+        })?)?;
+    }
+
+    // canvas{size=, aspect=, linen= or paper={...}, ground={...} or raw=, seed=}
+    {
+        let st = st.clone();
+        g.set(
+            "canvas",
+            lua.create_function(move |lua, o: Option<Table>| {
+                let o = o.ok_or_else(|| mlua::Error::runtime(CANVAS_HELP))?;
+                // an old log's canvas: a named style and palette (legacy.rs)
+                if !crate::studio::painter_lua() && crate::legacy::asks(&o)? {
+                    return crate::legacy::canvas(lua, &st, o);
+                }
+                let raw_ok = draw_soak::has_raw(st.borrow().tubes.engine);
+                check_keys(&o, if raw_ok { &["size", "aspect", "linen", "paper", "ground", "seed", "raw"] } else { &["size", "aspect", "linen", "paper", "ground", "seed"] }, "canvas")?;
+                if st.borrow().canvas.is_some() {
+                    return err("the canvas is already set up (canvas{} is the first chunk)");
+                }
+                let mm = num(&o, "size")?.ok_or_else(|| mlua::Error::runtime(format!("canvas: size= (the width in mm)\n{CANVAS_HELP}")))?;
+                if !(50.0..=5000.0).contains(&mm) {
+                    return err("canvas: size is the canvas width in mm, 50 to 5000");
+                }
+                let aspect = num(&o, "aspect")?.ok_or_else(|| mlua::Error::runtime(format!("canvas: aspect= (width / height)\n{CANVAS_HELP}")))?;
+                if !(0.2..=5.0).contains(&aspect) {
+                    return err("canvas: aspect is width / height, between 0.2 and 5");
+                }
+                let tubes = st.borrow().tubes.clone();
+                let seed = o.get::<Option<u64>>("seed")?.unwrap_or(1);
+                // paper=: a sheet of paper instead of linen
+                let paper_ok = st.borrow().paper;
+                let paper = match o.get::<Value>("paper")? {
+                    Value::Nil => None,
+                    Value::Table(t) => {
+                        if !paper_ok {
+                            return err(format!("canvas: paper= needs the paper-and-pastel switch, which this painting doesn't have: its log's head has no {:?} line (it was begun before paper)", crate::session::PAPER_MARK));
+                        }
+                        if o.contains_key("linen")? {
+                            return err("canvas: a sheet of paper or linen, not both");
+                        }
+                        if raw_ok && o.contains_key("raw")? {
+                            return err("canvas: a sheet of paper or a raw canvas, not both");
+                        }
+                        Some(paper_of(&tubes, &t, seed)?)
+                    }
+                    v => return err(format!("canvas: paper= is a table of the sheet's make ({{grammage=, tone=, felt=, ...}}), got {}", v.type_name())),
+                };
+                let width = st.borrow().width;
+                let (mut c, sty, support) = match paper {
+                    Some((p, tone)) => {
+                        // (a sheet of paper needs no ground: it is drawn and painted on as it is)
+                        let ground = match o.get::<Value>("ground")? {
+                            Value::Nil => Vec::new(),
+                            g => ground_of(&tubes, &g)?,
+                        };
+                        let sty = Style { name: "oil", width_mm: mm, raw: tone, ground, ..Style::oil_with((*tubes).clone()) };
+                        (sty.prepare_paper(width, aspect, seed, p), sty, format!("paper={} g/m²", fmt_num(p.grammage)))
+                    }
+                    None => {
+                        let or_paper = if paper_ok { ", or paper= (a sheet of paper)" } else { "" };
+                        let (warp, weft) = pair(&o, "linen")?.ok_or_else(|| mlua::Error::runtime(format!("canvas: linen= (threads per cm: one number, or {{warp, weft}}){or_paper}\n{CANVAS_HELP}")))?;
+                        if !((4.0..=60.0).contains(&warp) && (4.0..=60.0).contains(&weft)) {
+                            return err("canvas: linen threads per cm, 4 to 60");
+                        }
+                        // a raw canvas: no ground, the bare cloth
+                        let fabric = if raw_ok { draw_soak::fabric_of(&o)? } else { None };
+                        let ground = if fabric.is_some() { Vec::new() } else { ground_of(&tubes, &o.get::<Value>("ground")?)? };
+                        let mut sty = Style { name: "oil", width_mm: mm, linen: Linen { warp_per_cm: warp, weft_per_cm: weft, ..Linen::fine(1) }, ground, ..Style::oil_with((*tubes).clone()) };
+                        if let Some(f) = &fabric {
+                            sty.raw = f.color;
+                        }
+                        let mut c = crate::ground_cache::prepare(&sty, width, aspect, seed);
+                        let support = match &fabric {
+                            None => format!("linen={{{warp}, {weft}}}"),
+                            Some(f) => format!("linen={{{warp}, {weft}}}, raw={:?}", f.name),
+                        };
+                        if let Some(f) = fabric {
+                            c.raw_canvas(f, seed);
+                        }
+                        (c, sty, support)
+                    }
+                };
+                c = c.with_drain(tubes.drain);
+                let h = c.height();
+                {
+                    let mut s = st.borrow_mut();
+                    s.seed = seed;
+                    s.rng = Rng::new(mixseed(seed, s.chunk, 0xC0FFEE));
+                    s.clock0 = c.clock();
+                    s.clock = 0.0;
+                    // the clock counts from here: the ground is the colorman's
+                    time::start(&mut c);
+                    s.hand = time::Hand::default();
+                    s.recording_ground = crate::live_frames::ground_signature(&c);
+                    s.canvas = Some(c);
+                    s.style = Some(Rc::new(sty));
+                    s.canvas_src = Some(format!("canvas{}", lua_src(&Value::Table(o.clone()))?));
+                    s.setup = Some(format!("size={}, aspect={aspect}, {support}, seed={seed}", fmt_num(mm)));
+                }
+                let gl = lua.globals();
+                // whole numbers as Lua integers (so `print(H)` says 714, not 714.0)
+                let hv = if h.fract() == 0.0 { Value::Integer(h as i64) } else { Value::Number(h as f64) };
+                gl.set("W", 1000)?;
+                gl.set("H", hv.clone())?;
+                Ok(hv)
+            })?,
+        )?;
+    }
+
+    // tubes(): the names of the tubes in the box
+    {
+        let st = st.clone();
+        g.set("tubes", lua.create_function(move |_, ()| Ok(st.borrow().tubes.tubes.iter().map(|t| t.name.to_string()).collect::<Vec<_>>()))?)?;
+    }
+
+    // pile{{"lead white", 6}, {"smalt", 1}, ..., medium=0.2}: knife a pile
+    // from tubes, in parts by volume, with that share of oil medium (or
+    // blot=0.3: that share of its oil drawn out)
+    {
+        let st = st.clone();
+        g.set("pile", lua.create_function(move |_, (t, extra): (Table, Variadic<Value>)| {
+            if !extra.is_empty() {
+                return err(r#"pile: expected exactly one table; put tube parts and options in the same table: pile{{"lead white", 1}, medium=0.2}; not pile(recipe, options)"#);
+            }
+            // the thinner is engine 3's, blotting, turpentine, the oil and a heap's name engine 4's:
+            // an older log's pile takes no such key
+            let engine = st.borrow().tubes.engine;
+            if engine < 4 && t.contains_key("turps")? {
+                return err(format!("pile: turps= needs engine 4; this painting is painted with engine {engine} (its log says so), where turpentine does nothing"));
+            }
+            check_keys(&t, if engine >= 4 { &["medium", "thinner", "blot", "turps", "oil", "name"] } else if engine >= 3 { &["medium", "thinner"] } else { &["medium"] }, "pile")?;
+            let medium = num(&t, "medium")?.unwrap_or(0.0);
+            if !(0.0..=0.95).contains(&medium) {
+                return err("pile: medium is the share of oil medium mixed in, 0 (as from the tube) to 0.95");
+            }
+            // blot=: the paint laid on blotting paper first, which draws out
+            // that share of its oil (0..0.5): leaner, stiffer paint that holds
+            // a ridge. It is medium taken away, so not both.
+            let blot = num(&t, "blot")?.unwrap_or(0.0);
+            if !(0.0..=0.5).contains(&blot) {
+                return err("pile: blot is the share of the paint's oil drawn out on blotting paper, 0 to 0.5");
+            }
+            if blot > 0.0 && medium > 0.0 {
+                return err("pile: blot draws oil out and medium adds it; give one");
+            }
+            let medium = if blot > 0.0 { -blot } else { medium };
+            // turps=: thinned with that share of turpentine, which flows on
+            // the brush and evaporates as the paint is laid (engine 4)
+            let turps = num(&t, "turps")?.unwrap_or(0.0);
+            if !(0.0..=0.9).contains(&turps) {
+                return err("pile: turps is the share of turpentine the paint is thinned with, 0 to 0.9");
+            }
+            let thinner = if engine >= 3 {
+                let v = match t.get::<Value>("thinner")? {
+                    Value::Nil => 0.0,
+                    Value::Integer(i) => i as f32,
+                    Value::Number(x) => x as f32,
+                    o => return err(format!("pile: thinner is the share of solvent (turpentine, spirits) by volume, 0 to 0.9; got {}", o.type_name())),
+                };
+                if !(0.0..=0.9).contains(&v) {
+                    return err(format!("pile: thinner {v}: the share of solvent (turpentine, spirits) by volume, 0 (none) to 0.9"));
+                }
+                Some(v)
+            } else {
+                None
+            };
+            // oil=: what the paint is ground in, "linseed" (as the tubes come), "walnut" or "poppy"
+            let oil_rate = match t.get::<Option<String>>("oil")?.as_deref() {
+                None | Some("linseed") => 1.0,
+                Some("walnut") => 0.8,
+                Some("poppy") => 0.6,
+                Some(o) => return err(format!("pile: oil {o:?}: \"linseed\", \"walnut\" or \"poppy\"")),
+            };
+            let tubes = st.borrow().tubes.clone();
+            let (parts, given) = parts_of(&tubes, &t, "pile")?;
+            let mut mix = tubes.pile(parts.clone());
+            mix.solvent = turps;
+            mix.oil_rate = oil_rate;
+            if st.borrow().canvas.is_none() {
+                return Err(no_canvas());
+            }
+            check_set_out(&st, &parts, "pile")?;
+            let name = t.get::<Option<String>>("name")?;
+            let given_sum: f32 = given.iter().map(|g| g.1).sum();
+            let medium = mix.effective_medium(medium);
+            let heap = knife(&st, parts.clone(), given_sum, medium, turps, oil_rate, name, "pile")?;
+            st.borrow_mut().board.heap_mut(heap).unwrap().thinner = thinner.unwrap_or(0.0);
+            // knifing it takes the hand a while
+            time::knife(&st, mix.color);
+            Ok(PileU { mix, medium, thinner, parts: given, heap, st: Some(st.clone()) })
+        })?)?;
+    }
+
+    // mix{{p1, w1}, {p2, w2}, ..., name=}: knife heaps already on the palette
+    // together into a new one, in those proportions by volume (as they are now)
+    // (a global from engine 4, as the knife: an older log keeps the globals it had)
+    if st.borrow().tubes.engine >= 4 {
+        let st = st.clone();
+        g.set("mix", lua.create_function(move |_, t: Table| {
+            check_keys(&t, &["name"], "mix")?;
+            if st.borrow().canvas.is_none() {
+                return Err(no_canvas());
+            }
+            let mut parts: Vec<(usize, f32)> = Vec::new();
+            let (mut wsum, mut medium, mut solvent, mut thinner, mut oil) = (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
+            for e in t.sequence_values::<Table>() {
+                let e = e?;
+                let p = pile_of(&e.get::<Value>(1)?, "mix")?;
+                visit(&st, &p, 0.35, "mix", &[])?;
+                let p = resolve(&st, p);
+                let w: f32 = e.get::<Option<f32>>(2)?.unwrap_or(1.0);
+                if !(w > 0.0 && w.is_finite()) {
+                    return err("mix: each heap's share is > 0");
+                }
+                let pigment_weight = w * if st.borrow().tubes.engine >= paint::PIGMENT_MIXER { (1.0 - p.medium).clamp(0.0, 1.5).max(1e-3) } else { 1.0 };
+                for &(i, f) in &p.mix.parts {
+                    match parts.iter_mut().find(|q| q.0 == i) {
+                        Some(q) => q.1 += f * pigment_weight,
+                        None => parts.push((i, f * pigment_weight)),
+                    }
+                }
+                medium += p.medium * w;
+                solvent += p.mix.solvent * w;
+                thinner += p.thinner() * w;
+                oil += p.mix.oil_rate * w;
+                wsum += w;
+            }
+            if wsum <= 0.0 {
+                return err("mix: give the heaps to knife together: mix{{p1, 1}, {p2, 0.5}}");
+            }
+            let part_sum = if st.borrow().tubes.engine >= paint::PIGMENT_MIXER { parts.iter().map(|q| q.1).sum() } else { wsum };
+            if st.borrow().tubes.calls_agree && ![wsum, part_sum, medium, solvent, thinner, oil].iter().all(|v| v.is_finite()) {
+                return err("mix: the shares add up to more than the easel can count; give smaller numbers in the same proportions");
+            }
+            parts.iter_mut().for_each(|q| q.1 /= part_sum);
+            let (medium, solvent, thinner, oil) = (medium / wsum, solvent / wsum, thinner / wsum, oil / wsum);
+            let tubes = st.borrow().tubes.clone();
+            let given = parts.iter().map(|&(i, v)| (tubes.tubes[i].name.to_string(), v * wsum)).collect();
+            let mut mix = tubes.pile(parts.clone());
+            mix.solvent = solvent;
+            mix.oil_rate = oil;
+            let name = t.get::<Option<String>>("name")?;
+            let medium = mix.effective_medium(medium);
+            let heap = knife(&st, parts, wsum, medium, solvent, oil, name, "mix")?;
+            st.borrow_mut().board.heap_mut(heap).unwrap().thinner = thinner;
+            time::knife(&st, mix.color);
+            Ok(PileU { mix, medium, thinner: Some(thinner), parts: given, heap, st: Some(st.clone()) })
+        })?)?;
+    }
+    // palette{dirty=0..1, set_out={"tube name", ...}, clean=true, scrape={p, "name"}}: how
+    // the board is kept; returns a description of the heaps on it (from engine 4)
+    if st.borrow().tubes.engine >= 4 {
+        let st = st.clone();
+        g.set("palette", lua.create_function(move |_, t: Option<Table>| {
+            if let Some(t) = &t {
+                check_keys(t, &["dirty", "set_out", "clean", "scrape"], "palette")?;
+                if let Some(d) = num(t, "dirty")? {
+                    if !(0.0..=1.0).contains(&d) {
+                        return err("palette: dirty is how dirty the board is kept, 0 (clean) to 1");
+                    }
+                    st.borrow_mut().board.dirty = d;
+                }
+                if let Some(list) = t.get::<Option<Table>>("set_out")? {
+                    let tubes = st.borrow().tubes.clone();
+                    let mut set = Vec::new();
+                    for n in list.sequence_values::<String>() {
+                        let n = n?;
+                        let i = tubes.tubes.iter().position(|x| x.name == n).ok_or_else(|| mlua::Error::runtime(format!("palette: no tube {n:?} in the box")))?;
+                        set.push(i);
+                    }
+                    st.borrow_mut().board.set_out = if set.is_empty() { None } else { Some(set) };
+                }
+                if t.get::<Option<bool>>("clean")?.unwrap_or(false) {
+                    st.borrow_mut().board.clean();
+                }
+                // scrape={p1, "sky"}: piles, or the names palette() lists heaps under (a pile
+                // whose variable is gone): every heap listed under that name
+                if let Some(list) = t.get::<Option<Table>>("scrape")? {
+                    let mut heaps = Vec::new();
+                    for v in list.sequence_values::<Value>() {
+                        match v? {
+                            Value::String(name) => {
+                                let name = name.to_str()?.to_string();
+                                let s = st.borrow();
+                                let named: Vec<u64> = s.board.live().iter().filter(|h| crate::board::label(h) == name).map(|h| h.id).collect();
+                                if named.is_empty() {
+                                    let on: Vec<String> = s.board.live().iter().map(|h| format!("{:?}", crate::board::label(h))).collect();
+                                    return err(format!("palette: scrape: no pile on the palette is listed as {name:?} (on it now: {})", if on.is_empty() { "none".to_string() } else { on.join(", ") }));
+                                }
+                                heaps.extend(named);
+                            }
+                            v => {
+                                let p = pile_of(&v, "palette scrape")?;
+                                if p.heap == 0 {
+                                    return err("palette: scrape takes piles knifed on this palette");
+                                }
+                                heaps.push(p.heap);
+                            }
+                        }
+                    }
+                    for h in heaps {
+                        st.borrow_mut().board.scrape(h);
+                    }
+                }
+            }
+            let s = st.borrow();
+            Ok(s.board.describe(&s.tubes))
+        })?)?;
+    }
+
+    // numbers
+    g.set("smoothstep", lua.create_function(|_, (a, b, x): (f32, f32, f32)| Ok(paint::smoothstep(a, b, x)))?)?;
+    g.set("lerp", lua.create_function(|_, (a, b, t): (f32, f32, f32)| Ok(paint::lerp(a, b, t)))?)?;
+    g.set("clamp", lua.create_function(|_, (x, a, b): (f32, Option<f32>, Option<f32>)| Ok(x.clamp(a.unwrap_or(0.0), b.unwrap_or(1.0))))?)?;
+    // noise{seed=, octaves=, period=, persistence=, kind="fbm"|"ridged"|"billow",
+    //       warp={period, amount, twice}, stretch={angle, k}}
+    g.set("noise", lua.create_function(|_, o: Option<Table>| {
+        let o = match o {
+            None => return Ok(Noise { kind: NoiseKind::Fbm(Fbm::new(1, 4, 200.0)), warp: None, stretch: None }),
+            Some(o) => o,
+        };
+        check_keys(&o, &["seed", "octaves", "period", "persistence", "kind", "warp", "stretch"], "noise")?;
+        let (seed, oct, period) = (o.get::<Option<u32>>("seed")?.unwrap_or(1), o.get::<Option<usize>>("octaves")?.unwrap_or(4), num(&o, "period")?.unwrap_or(200.0));
+        let pers = o.get::<Option<f64>>("persistence")?;
+        use paint::noise::{Fold, Octaves};
+        let kind = match o.get::<Option<String>>("kind")?.as_deref().unwrap_or("fbm") {
+            "fbm" => NoiseKind::Fbm(Fbm::new(seed, oct, period).with_persistence(pers.unwrap_or(0.5))),
+            k @ ("ridged" | "billow" | "plain") => {
+                let fold = match k {
+                    "ridged" => Fold::Ridged,
+                    "billow" => Fold::Billow,
+                    _ => Fold::Plain,
+                };
+                let mut n = Octaves::new(seed, oct, period, fold);
+                if let Some(p) = pers {
+                    n = n.persistence(p as f32);
+                }
+                NoiseKind::Octaves(n)
+            }
+            k => return err(format!("noise kind {k:?}: fbm, ridged, billow or plain")),
+        };
+        let warp = match o.get::<Option<Table>>("warp")? {
+            None => None,
+            Some(t) => {
+                let mut w = paint::noise::Warp::new(seed.wrapping_add(17), t.get(1)?, t.get(2)?);
+                if t.get::<Option<bool>>(3)?.unwrap_or(false) {
+                    w = w.twice();
+                }
+                Some(w)
+            }
+        };
+        let stretch = pair(&o, "stretch")?.map(|(a, k)| paint::noise::Aniso::new(a, k));
+        Ok(Noise { kind, warp, stretch })
+    })?)?;
+    // worley{seed=, period=, jitter=}: cells
+    g.set("worley", lua.create_function(|_, o: Option<Table>| {
+        let (seed, period, jitter) = match &o {
+            None => (1, 40.0, None),
+            Some(o) => {
+                check_keys(o, &["seed", "period", "jitter"], "worley")?;
+                (o.get::<Option<u32>>("seed")?.unwrap_or(1), num(o, "period")?.unwrap_or(40.0), num(o, "jitter")?)
+            }
+        };
+        let mut w = paint::noise::Worley::new(seed, period);
+        if let Some(j) = jitter {
+            w = w.jitter(j);
+        }
+        Ok(WorleyU(w))
+    })?)?;
+    // uneven(n, lo, hi, irregular?, clump?, seed?): n positions between lo and hi,
+    // spaced as a hand spaces them (lognormal gaps, grouped in clumps)
+    g.set("uneven", lua.create_function(|_, (n, lo, hi, irr, clump, seed): (usize, f32, f32, Option<f32>, Option<f32>, Option<u32>)| {
+        Ok(paint::noise::uneven(n, lo, hi, irr.unwrap_or(0.6), clump.unwrap_or(0.3), seed.unwrap_or(1)))
+    })?)?;
+    // masks
+    {
+        let st1 = st.clone();
+        g.set("mask", lua.create_function(move |_, f: Function| Ok(wrap(eval_mask(frame(&st1)?, &f)?)))?)?;
+        let st1 = st.clone();
+        g.set("everywhere", lua.create_function(move |_, ()| Ok(wrap(Mask::full(frame(&st1)?))))?)?;
+        let st1 = st.clone();
+        g.set("ellipse", lua.create_function(move |_, (cx, cy, rx, ry): (f32, f32, f32, Option<f32>)| {
+            Ok(wrap(Mask::from_shape(frame(&st1)?, Shape::new().ellipse(cx, cy, rx, ry.unwrap_or(rx)))))
+        })?)?;
+        let st1 = st.clone();
+        g.set("rect", lua.create_function(move |_, (x, y, w, h): (f32, f32, f32, f32)| Ok(wrap(Mask::from_shape(frame(&st1)?, Shape::new().rect(x, y, w, h)))))?)?;
+        let st1 = st.clone();
+        g.set("poly", lua.create_function(move |_, (p, smooth): (Value, Option<bool>)| {
+            let pts = points(&p)?;
+            if pts.len() < 3 {
+                return err("poly: needs at least three points");
+            }
+            let s = if smooth.unwrap_or(false) { Shape::new().smooth_poly(&pts) } else { Shape::new().poly(&pts) };
+            Ok(wrap(Mask::from_shape(frame(&st1)?, s)))
+        })?)?;
+        // below(curve, bottom?): everything under a curve (points or function(x) -> y)
+        let st1 = st.clone();
+        g.set("below", lua.create_function(move |_, (c, bottom): (Value, Option<f32>)| {
+            let f = frame(&st1)?;
+            let pts = curve_of(&c, f.width())?;
+            Ok(wrap(Mask::from_shape(f, Shape::new().below(&pts, bottom.unwrap_or(f.height() + 1.0)))))
+        })?)?;
+        let st1 = st.clone();
+        g.set("above", lua.create_function(move |_, c: Value| {
+            let f = frame(&st1)?;
+            let pts = curve_of(&c, f.width())?;
+            Ok(wrap(Mask::from_shape(f, Shape::new().below(&pts, f.height() + 1.0)).invert()))
+        })?)?;
+        // ribbon(points, widths): a band along a line
+        let st1 = st.clone();
+        g.set("ribbon", lua.create_function(move |_, (p, w): (Value, Value)| {
+            let pts = points(&p)?;
+            let ws: Vec<f32> = match w {
+                Value::Table(t) => t.sequence_values::<f32>().collect::<Result<_>>()?,
+                Value::Number(n) => vec![n as f32; pts.len()],
+                Value::Integer(n) => vec![n as f32; pts.len()],
+                v => return err(format!("ribbon: widths: want one width or a table of one per point, got {}", v.type_name())),
+            };
+            if ws.len() != pts.len() || pts.len() < 2 {
+                return err("ribbon: needs >= 2 points and one width per point (or one width)");
+            }
+            Ok(wrap(Mask::from_shape(frame(&st1)?, Shape::new().ribbon(&pts, &ws))))
+        })?)?;
+    }
+
+    // brushes
+    {
+        let st1 = st.clone();
+        g.set("brush", lua.create_function(move |lua, (a, w): (Value, Option<f32>)| {
+            let tool = match (&a, w) {
+                (Value::String(s), Some(w)) => tool_named(&s.to_str()?, w)?,
+                (v, _) => tool_of(&st1, v)?,
+            };
+            let seed = st1.borrow_mut().auto_seed();
+            let (engine, drain) = (st1.borrow().tubes.engine, st1.borrow().tubes.drain);
+            let held = Rc::new(RefCell::new(Held::new(tool, seed).with_engine(engine).with_packing(drain)));
+            st1.borrow_mut().brushes.push(Rc::downgrade(&held));
+            crate::replay_checkpoint::hold_tools(&st1);
+            let b = Brush { held, st: st1.clone() };
+            // with the paper-and-pastel switch, a brush with `b:dust` too
+            // (`install_paper` registers it); without it, a brush as it was
+            if st1.borrow().paper { lua.create_any_userdata(b) } else { lua.create_userdata(b) }
+        })?)?;
+    }
+
+    // knife{width=}: a painting knife, its blade that many units long (from
+    // engine 4: an older log replays with exactly the globals it had, as
+    // with the rag, `draw_rag::has_rag`)
+    if st.borrow().tubes.engine >= 4 {
+        let st1 = st.clone();
+        g.set("knife", lua.create_function(move |_, o: Option<Table>| {
+            let width = match &o {
+                Some(o) => {
+                    check_keys(o, &["width"], "knife")?;
+                    num(o, "width")?.unwrap_or(20.0)
+                }
+                None => 20.0,
+            };
+            if !(2.0..=200.0).contains(&width) {
+                return err("knife{width=}: the blade's length in units, 2 to 200");
+            }
+            let k = Rc::new(RefCell::new(paint::Knife::new(width).with_engine(st1.borrow().tubes.engine).with_packing(st1.borrow().tubes.drain)));
+            st1.borrow_mut().knives.push(Rc::downgrade(&k));
+            crate::replay_checkpoint::hold_tools(&st1);
+            Ok(KnifeU { k, st: st1.clone() })
+        })?)?;
+    }
+
+    // covering areas
+    {
+        let st1 = st.clone();
+        g.set("work", lua.create_function(move |_, (m, o): (Value, Table)| work(&st1, mask_of(&m)?, o, None))?)?;
+        let st1 = st.clone();
+        g.set("blend", lua.create_function(move |lua, (m, o): (Value, Option<Table>)| {
+            let o = o.unwrap_or(lua.create_table()?);
+            work(&st1, mask_of(&m)?, o, Some("blend"))
+        })?)?;
+        let st1 = st.clone();
+        g.set("stipple", lua.create_function(move |_, (m, o): (Value, Table)| stipple(&st1, mask_of(&m)?, o))?)?;
+    }
+
+    // time
+    {
+        // wait(minutes): time passes with the hand away from the canvas; the
+        // paint ages where it lies (open, setting, tacky, touch-dry by
+        // pigment, film and oil). Returns the time of day. At most 10 years.
+        let st1 = st.clone();
+        g.set("wait", lua.create_function(move |_, minutes: f64| {
+            if !(0.0..=MAX_WAIT_MIN).contains(&minutes) {
+                return err(format!("wait({minutes}): want minutes from 0 to {MAX_WAIT_MIN} (10 years); days are fine: wait(3 * 24 * 60)"));
+            }
+            time::verb(&st1, Verb::Wait, |s| {
+                s.canvas.as_mut().ok_or_else(no_canvas)?.wait(minutes as f32);
+                Ok(())
+            })?;
+            Ok(time::time_of_day(st1.borrow().clock))
+        })?)?;
+        // drying(x, y): "open", "setting", "tacky" or "dry": the paint there, as a knuckle feels it
+        let st1 = st.clone();
+        g.set("drying", lua.create_function(move |_, (x, y): (f32, f32)| {
+            time::verb(&st1, Verb::Query, |s| {
+                let stage = s.canvas.as_ref().ok_or_else(no_canvas)?.drying_at(x, y);
+                s.drying_feedback.queried(x, y, stage);
+                Ok(match stage {
+                    paint::Stage::Open => "open",
+                    paint::Stage::Setting => "setting",
+                    paint::Stage::Tacky => "tacky",
+                    paint::Stage::Dry => "dry",
+                }.to_string())
+            })
+        })?)?;
+    }
+
+    if !crate::studio::painter_lua() {
+        crate::finish::install(lua, st.clone())?;
+    }
+
+    crate::form::install(lua, st.clone())?;
+    crate::world::install(lua, st.clone())?;
+    draw_pencil::install(lua, st.clone())?;
+    if draw_rag::has_rag(st.borrow().tubes.engine) {
+        draw_rag::install(lua, st.clone())?;
+    }
+    if draw_soak::has_raw(st.borrow().tubes.engine) {
+        draw_soak::install(lua, st.clone())?;
+    }
+    crate::draw_outline::install(lua, st.clone())?;
+    crate::draw_edges::install(lua, st.clone())?;
+    Ok(())
+}
+
+/// The verbs the paper-and-pastel switch brings (`Studio::paper`): pastel
+/// sticks, the finger, `feel` and the paper mask (draw_pencil.rs
+/// `install_paper`), and a dry brush over pastel (`b:dust`). Run once, after
+/// `install` and before the first chunk (before any brush is made), when the
+/// switch is on.
+pub(crate) fn install_paper(lua: &Lua, st: S) -> Result<()> {
+    // a brush's methods are its type's: brushes made with the switch
+    // (`create_any_userdata`) take these, main's and `dust`; brushes made
+    // without it keep exactly main's (`UserData for Brush`)
+    lua.register_userdata_type::<Brush>(|reg| {
+        <Brush as UserData>::register(reg);
+        add_dust(reg);
+    })?;
+    draw_pencil::install_paper(lua, st)
+}
+
+
+
+
+const CANVAS_HELP: &str = "canvas{size=<mm>, aspect=<width / height>, linen=<threads per cm>, ground={{pile={{\"<tube>\", <parts>}, ...}, um=<µm>, apply=\"<knife|roller|brush>\"}, ...}, seed=<n>}\n  size: width in mm; aspect: width / height; linen: threads per cm (or {warp, weft});\n  ground: layers bottom first, each a pile of tubes, a thickness in µm and how it is put on (\"knife\", \"roller\" or \"brush\"; a knife takes texture=0..1)\n  or paper={grammage=, tone={{\"<tube>\", <parts>}, ...}, felt={cell=, depth=}|false, laid={per_cm=, chain=, deficit=}, ...} instead of linen: a sheet of paper (a ground is then optional)\n  or raw=\"cotton duck\" (or \"linen\") and no ground: the bare cloth (engine 3)";
+
+/// A sheet of paper from `canvas{paper={...}}`, and its tone: the pulp's
+/// color, tubes' pigments as they look dry (a dyed or toned sheet), or the
+/// color of cotton rag if none is given. Every key has a default
+/// (`Paper::drawing`).
+fn paper_of(tubes: &Palette, t: &Table, seed: u64) -> Result<(paint::paper::Paper, paint::Rgb)> {
+    use paint::paper::{Felt, Laid, Paper};
+    check_keys(t, &["grammage", "fiber", "fiber_width", "thickness", "coarseness", "porosity", "floc", "floc_size", "press", "calender", "felt", "laid", "absorbent", "stiffness", "tone"], "paper")?;
+    let d = Paper::drawing(seed);
+    let get = |k: &str, def: f32, lo: f32, hi: f32| -> Result<f32> {
+        let v = num(t, k)?.unwrap_or(def);
+        if !(lo..=hi).contains(&v) {
+            return err(format!("paper: {k} between {lo} and {hi}"));
+        }
+        Ok(v)
+    };
+    let felt = match t.get::<Value>("felt")? {
+        Value::Nil => d.felt,
+        Value::Boolean(false) => None,
+        Value::Table(f) => {
+            check_keys(&f, &["cell", "depth"], "paper felt")?;
+            let (cell, depth) = (num(&f, "cell")?.unwrap_or(0.8), num(&f, "depth")?.unwrap_or(20.0));
+            // (clamp keeps a NaN: refuse it first)
+            if !(cell.is_finite() && depth.is_finite()) {
+                return err("paper: felt= cell and depth are numbers (mm, µm)");
+            }
+            Some(Felt { cell_mm: cell.clamp(0.1, 5.0), depth_um: depth.clamp(0.0, 200.0) })
+        }
+        _ => return err("paper: felt= {cell=mm, depth=µm}, or false for none"),
+    };
+    let laid = match t.get::<Value>("laid")? {
+        Value::Nil | Value::Boolean(false) => None,
+        Value::Table(l) => {
+            check_keys(&l, &["per_cm", "chain", "deficit"], "paper laid")?;
+            let (per_cm, chain, deficit) = (num(&l, "per_cm")?.unwrap_or(10.0), num(&l, "chain")?.unwrap_or(25.0), num(&l, "deficit")?.unwrap_or(0.15));
+            if !(per_cm.is_finite() && chain.is_finite() && deficit.is_finite()) {
+                return err("paper: laid= per_cm, chain and deficit are numbers");
+            }
+            Some(Laid { per_cm: per_cm.clamp(2.0, 20.0), chain_mm: chain.clamp(5.0, 60.0), deficit: deficit.clamp(0.0, 0.5) })
+        }
+        _ => return err("paper: laid= {per_cm=, chain=mm, deficit=}"),
+    };
+    let p = Paper {
+        grammage: get("grammage", d.grammage, 40.0, 600.0)?,
+        fiber_mm: get("fiber", d.fiber_mm, 0.3, 10.0)?,
+        fiber_um: get("fiber_width", d.fiber_um, 8.0, 60.0)?,
+        thick_um: get("thickness", d.thick_um, 2.0, 30.0)?,
+        coarseness: get("coarseness", d.coarseness, 0.04, 0.5)?,
+        porosity: get("porosity", d.porosity, 0.2, 0.8)?,
+        floc: get("floc", d.floc, 0.0, 1.0)?,
+        floc_mm: get("floc_size", d.floc_mm, 0.2, 10.0)?,
+        press: get("press", d.press, 0.3, 1.0)?,
+        calender: get("calender", d.calender, 0.0, 1.0)?,
+        absorbent: get("absorbent", d.absorbent, 0.0, 1.0)?,
+        z_mpa: get("stiffness", d.z_mpa, 2.0, 500.0)?,
+        felt,
+        laid,
+        seed,
+    };
+    // the tone: parts of tubes, as a ground's paste is given ({{"tube", parts}, ...})
+    let tone = match t.get::<Value>("tone")? {
+        Value::Nil => paint::hex("#e8e0cf"),
+        Value::Table(p) => tubes.dry_color(&parts_of(tubes, &p, "paper tone")?.0),
+        v => return err(format!("paper: tone= is parts of tubes ({{{{\"tube\", parts}}, ...}}), got {}", v.type_name())),
+    };
+    Ok((p, tone))
+}
+
+/// Ground layers from `{{pile={{tube, parts}, ...}, um=, apply=, texture=}, ...}`,
+/// bottom first: each the paste its tubes make (masstone, hiding, stiffness).
+fn ground_of(tubes: &Palette, v: &Value) -> Result<Vec<Ground>> {
+    let Value::Table(t) = v else {
+        return err(format!("canvas: ground= (the layers, bottom first)\n{CANVAS_HELP}"));
+    };
+    let mut out = Vec::new();
+    for l in t.sequence_values::<Value>() {
+        let Value::Table(l) = l? else { return err(format!("canvas: each ground layer is a table\n{CANVAS_HELP}")) };
+        check_keys(&l, &["pile", "um", "apply", "texture", "absorbent"], "ground layer")?;
+        let Value::Table(p) = l.get::<Value>("pile")? else { return err(format!("canvas: a ground layer needs pile={{{{tube, parts}}, ...}}\n{CANVAS_HELP}")) };
+        let (parts, _) = parts_of(tubes, &p, "ground")?;
+        let m = tubes.pile(parts);
+        let um = num(&l, "um")?.ok_or_else(|| mlua::Error::runtime("canvas: a ground layer needs um= (its thickness in µm)"))?;
+        if !(5.0..=400.0).contains(&um) {
+            return err("canvas: a ground layer is 5 to 400 µm thick");
+        }
+        let texture = num(&l, "texture")?.unwrap_or(0.3).clamp(0.0, 1.0);
+        let apply = match l.get::<Option<String>>("apply")?.as_deref() {
+            Some("knife") => Apply::Knife { texture },
+            Some("roller") => Apply::Roller,
+            Some("brush") => Apply::Brush,
+            _ => return err("canvas: a ground layer's apply= is \"knife\", \"roller\" or \"brush\""),
+        };
+        // absorbent=: a chalk and glue ground (true, or 0..1), which draws oil
+        // out of the paint laid on it
+        let absorbent = match l.get::<Value>("absorbent")? {
+            Value::Nil => 0.0,
+            Value::Boolean(b) => if b { 1.0 } else { 0.0 },
+            // (NaN passes a clamp, and would leave the ground's gloss NaN)
+            Value::Number(n) if !n.is_nan() => (n as f32).clamp(0.0, 1.0),
+            Value::Integer(n) => (n as f32).clamp(0.0, 1.0),
+            _ => return err("canvas: a ground layer's absorbent= is true or 0..1"),
+        };
+        if absorbent > 0.0 && tubes.engine < 4 {
+            return err(format!("canvas: a ground layer's absorbent= needs engine 4; this painting is painted with engine {} (its log says so), where a ground absorbs nothing", tubes.engine));
+        }
+        out.push(Ground { color: m.color, hiding: m.hiding, paint: (tubes.engine >= paint::PIGMENT_MIXER).then(|| m.paint(0.0)), um, stiff: m.stiff, apply, absorbent });
+    }
+    if out.is_empty() {
+        return err(format!("canvas: ground= needs at least one layer\n{CANVAS_HELP}"));
+    }
+    Ok(out)
+}
+
+// Default-box sessions (`Session::new`, `Session::replay`): not in a painter build for one box.
+#[cfg(test)]
+mod mask_coverage_tests {
+    use crate::session::{Session, box_for};
+
+    fn painting(engine: u32, clamped: bool, action: &str) -> String {
+        let mut s = Session::replay_with(128, box_for(Some(&format!("--@ engine {engine}\n"))).unwrap()).unwrap();
+        s.run(r#"canvas{size=400, aspect=1, linen=15, seed=7, ground={{pile={{"lead white",1}}, um=120, apply="knife"}}}
+            p=pile{{"cobalt blue",1}}
+            d=rect(250,250,500,500):distance()
+            m=d
+            b=brush("flat",40,17)
+            b:load(p,0.8)"#).unwrap();
+        if clamped {
+            s.run("m=d:map(function(v) return clamp(v,0,1) end)").unwrap();
+        } else {
+            s.run("m=d").unwrap();
+        }
+        s.run(action).unwrap();
+        s.run(r#"assert(d:at(500,500)>200 and d:at(100,500)<-100)
+            assert(d:map(function(v) return v*2 end):at(500,500)>400)
+            assert(d:band(0,40,4):at(100,500)==0)
+            assert(d:map(function(v) return smoothstep(-20,20,v) end):at(500,500)==1)"#).unwrap();
+        crate::state_digest_line(&s, 0, 0.0)
+    }
+
+    #[test]
+    fn distance_clip_is_coverage_from_engine9() {
+        let stroke = "b:stroke({{100,500},{900,500}},{pressure={0.8,0.8},ramps={0,0},clip=m})";
+        assert_ne!(painting(8, false, stroke), painting(8, true, stroke));
+        for action in [
+            stroke,
+            "b:gesture({{100,500,0.8},{900,500,0.8}},{clip=m})",
+            "b:touch(500,500,{clip=m})",
+            "b:spatter{at={100,500},toward={800,0},clip=m}",
+            "work(m,{pile=p,tool='flat 40',coverage=0.2,seed=17})",
+            "blend(m,{tool='flat 40',coverage=0.2,seed=17})",
+            "stipple(m,{pile=p,width=40,coverage=0.2,seed=17})",
+            "work(everywhere(),{pile=p,tool='flat 40',coverage=0.2,clip=m,seed=17})",
+            "stipple(everywhere(),{pile=p,width=40,coverage=0.2,clip=m,seed=17})",
+            "v=world{horizon=250}:view(); work(everywhere(),{pile=p,tool='flat 40',coverage=0.2,visible=m,clip=mask(function() return 0.5 end),seed=17})",
+            "v=world{horizon=250}:view(); work(everywhere(),{pile=p,tool='flat 40',coverage=0.2,visible=mask(function() return 0.5 end),clip=m,seed=17})",
+            "v=world{horizon=250}:view(); stipple(everywhere(),{pile=p,width=40,coverage=0.2,behind=m,seed=17})",
+        ] {
+            assert_eq!(painting(9, false, action), painting(9, true, action), "{action}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod carried_palette_tests {
+    use crate::session::{Session, box_for, CARRIED_PAINT_MARK};
+
+    fn painting(carried: bool) -> Session {
+        let log = format!("--@ engine 8\n{}\n", if carried { CARRIED_PAINT_MARK } else { "" });
+        let mut s = Session::replay_with(96, box_for(Some(&log)).unwrap()).unwrap();
+        s.run(r#"canvas{size=400, aspect=1, linen=15, seed=7, ground={{pile={{"lead white",1}}, um=120, apply="knife"}}}
+            white=pile{{"lead white",1},name="white"}
+            blue=pile{{"cobalt blue",1},name="blue"}
+            red=pile{{"vermilion",1},name="red"}"#).unwrap();
+        s
+    }
+
+    fn dirt(s: &Session, heap: &str, tube: &str) -> f32 {
+        let s = s.st.borrow();
+        let i = s.tubes.tubes.iter().position(|t| t.name == tube).unwrap();
+        s.board.heaps.iter().find(|h| h.name.as_deref() == Some(heap)).unwrap().dirt.iter().filter(|p| p.0 == i).map(|p| p.1).sum()
+    }
+
+    #[test]
+    fn engine9_dirty_dips_compare_composition_and_cap_concentrated_dirt() {
+        for medium in [0.9, -0.3] {
+            let dilution = if medium > 0.0 { format!("medium={medium}") } else { format!("blot={}", -medium) };
+            for (tool, carry) in [("brush('flat',12)", 1.0), ("knife{width=12}", 0.5)] {
+                for near_cap in [false, true] {
+                    let log = format!("--@ engine 9\n{CARRIED_PAINT_MARK}\n");
+                    let mut s = Session::replay_with(16, box_for(Some(&log)).unwrap()).unwrap();
+                    s.run(&format!(r#"canvas{{size=100,aspect=1,linen=15,seed=1,raw="cotton duck"}}
+                        white=pile{{{{"lead white",1}},{dilution},name="white"}}
+                        mixed=pile{{{{"lead white",1}},{{"cobalt blue",1}},name="mixed"}}
+                        b={tool}; b:load(white,1)
+                        palette{{dirty=1}}; b:load(white,1)"#)).unwrap();
+                    assert_eq!(dirt(&s, "white", "lead white"), 0.0, "{tool}, medium={medium}");
+                    if near_cap {
+                        let mut st = s.st.borrow_mut();
+                        let white = st.tubes.tubes.iter().position(|t| t.name == "lead white").unwrap();
+                        st.board.heaps.iter_mut().find(|h| h.name.as_deref() == Some("mixed")).unwrap().dirt = vec![(white, 0.4999)];
+                    }
+                    s.run("b:load(mixed,1)").unwrap();
+                    let expected = if near_cap { 0.5 } else { 0.03 * carry * (1.0 - medium) };
+                    let got = dirt(&s, "mixed", "lead white");
+                    assert!((got - expected).abs() < 1e-6, "{tool}, medium={medium}, near_cap={near_cap}: {got} != {expected}");
+                    assert_eq!(dirt(&s, "mixed", "cobalt blue"), 0.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn engine9_internal_dips_compare_normalized_carried_pigments() {
+        for medium in [0.9, -0.3] {
+            let dilution = if medium > 0.0 { format!("medium={medium}") } else { format!("blot={}", -medium) };
+            let log = format!("--@ engine 9\n{CARRIED_PAINT_MARK}\n");
+            let mut s = Session::replay_with(16, box_for(Some(&log)).unwrap()).unwrap();
+            s.run(&format!(r#"canvas{{size=100,aspect=1,linen=15,seed=1,raw="cotton duck"}}
+                white=pile{{{{"lead white",1}},{dilution},name="white"}}
+                mixed=pile{{{{"lead white",1}},{{"cobalt blue",1}},name="mixed"}}
+                b=brush('flat',12); b:load(white,1); palette{{dirty=1}}"#)).unwrap();
+            let brush = s.lua.globals().get::<mlua::AnyUserData>("b").unwrap();
+            let held = brush.borrow::<super::Brush>().unwrap().held.clone();
+            let piles = ["white", "mixed"].map(|name| s.lua.globals().get::<mlua::AnyUserData>(name).unwrap().borrow::<super::PileU>().unwrap().clone());
+            let (board, tubes) = {
+                let st = s.st.borrow();
+                (std::sync::Arc::new(std::sync::Mutex::new(st.board.clone())), (*st.tubes).clone())
+            };
+            let dip = super::pass_dips(board.clone(), tubes, piles.into(), 0.0);
+            dip(&held.borrow(), &[(0, 1.0)], 1);
+            let board = {
+                dip(&held.borrow(), &[(1, 1.0)], 1);
+                board.lock().unwrap()
+            };
+            assert_eq!(board.heaps[0].dirt_volume(), 0.0, "medium={medium}");
+            let expected = 0.03 * held.borrow().fullness().min(1.0) * (1.0 - medium);
+            let got = board.heaps[1].dirt_volume();
+            assert!((got - expected).abs() < 1e-6, "medium={medium}: {got} != {expected}");
+        }
+    }
+
+    #[test]
+    fn a_dip_brings_the_arriving_brushs_paint_not_another_brushs_history() {
+        for carried in [false, true] {
+            let mut s = painting(carried);
+            s.run(r#"w=brush("flat",12); b=brush("flat",12)
+                w:load(white); b:load(blue)
+                palette{dirty=1}
+                b:load(blue); w:load(red)"#).unwrap();
+            let (white, blue) = (dirt(&s, "red", "lead white"), dirt(&s, "red", "cobalt blue"));
+            if carried {
+                assert!(white > 0.02 && blue == 0.0, "white={white}, blue={blue}");
+            } else {
+                assert!(blue > 0.02 && white == 0.0, "legacy white={white}, blue={blue}");
+            }
+            assert_eq!(s.program("palette").contains(CARRIED_PAINT_MARK), carried);
+            let path = std::env::temp_dir().join(format!("easel-carried-paint-{}-{carried}.ckpt", std::process::id()));
+            crate::save::write(&s, &s.program("palette"), &path).unwrap();
+            let restored = crate::save::read(&path).unwrap().session;
+            std::fs::remove_file(path).unwrap();
+            assert_eq!(restored.st.borrow().tubes.carried_paint, carried);
+        }
+        assert!(box_for(None).unwrap().carried_paint);
+        assert!(!box_for(Some("--@ engine 8\n--@ chunk 1\n--@ palette-carried-paint\n")).unwrap().carried_paint);
+    }
+
+    #[test]
+    fn graded_dips_preserve_palette_tint_strength_at_negligible_dirt() {
+        let latent = |dirty: f32| {
+            let mut s = painting(true);
+            s.run(&format!(r#"strong=pile{{{{"Prussian blue",1}}}}
+                palette{{dirty={dirty}}}
+                work(rect(100,100,800,800),{{piles={{{{white,0.5}},{{strong,0.5}}}},tool={{kind="flat",width=50}},length={{80,80}},coverage=1,dips={{1,0.8,1}},mix_jitter=0,fill=false,seed=11}})"#)).unwrap();
+            s.canvas().unwrap().state_fields().into_iter().find_map(|f| match f.values {
+                paint::state_dump::Values::F32(v) if f.name == "wet.lat" => Some(v),
+                _ => None,
+            }).unwrap()
+        };
+        let (clean, dirty) = (latent(0.0), latent(1e-8));
+        assert_eq!(clean.len(), dirty.len());
+        assert!(clean.iter().any(|v| *v != 0.0));
+        let difference = clean.iter().zip(&dirty).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(difference < 1e-6, "negligible palette dirt changed graded pigment mixing by {difference}");
+    }
+
+    #[test]
+    fn every_internal_dip_carries_the_paint_retained_from_the_canvas() {
+        for pass in [
+            "work(rect(100,100,800,800),{pile=red,tool={kind='flat',width=50},length={80,80},coverage=1,dips={1,0.8,0},mix_jitter=0,fill=false,seed=11})",
+            "stipple(rect(100,100,800,800),{pile=red,tool={kind='round',width=50},coverage=1,dips={1,0.8,0},mix_jitter=0,seed=11})",
+            "work(rect(100,100,800,800),{pile=red,piles={{white,0},{blue,0}},second={pile=white,load=0.2},tool={kind='flat',width=50},length={80,80},coverage=1,dips={1,0.8,0},mix_jitter=0,fill=false,seed=11})",
+        ] {
+            let mut s = painting(true);
+            s.run("work(rect(0,0,1000,1000),{pile=blue,tool={kind='flat',width=80},coverage=3,fill=true,mix_jitter=0,seed=2})").unwrap();
+            s.run("palette{dirty=1}").unwrap();
+            s.run(pass).unwrap();
+            assert!(dirt(&s, "red", "cobalt blue") > 0.0, "no picked-up blue returned to red: {pass}");
+            assert!(s.st.borrow().board.residue_amount > 0.5, "only a setup-time visit: {pass}");
+            let c = s.canvas().unwrap();
+            let mut bytes = Vec::new();
+            c.write_state(&mut bytes, "palette").unwrap();
+            let (restored, _) = paint::Canvas::read_state(&mut &bytes[..]).unwrap();
+            let mut again = Vec::new();
+            restored.write_state(&mut again, "palette").unwrap();
+            assert_eq!(bytes, again);
+        }
+    }
+}
+
+// a new painting's calls agree with each other (session.rs CALLS_AGREE_MARK); an older log's as they were
+#[cfg(test)]
+mod calls_agree_tests {
+    use crate::session::{Session, box_for};
+
+    const CANVAS: &str = r#"canvas{size=100, aspect=1, linen=15, seed=1, ground={{pile={{"lead white", 1}}, um=40, apply="knife"}}}"#;
+
+    fn sessions() -> [(bool, Session); 2] {
+        [false, true].map(|agree| {
+            let mut tubes = box_for(None).unwrap();
+            tubes.calls_agree = agree;
+            let mut s = Session::with_box(16, tubes).unwrap();
+            s.run(CANVAS).unwrap();
+            (agree, s)
+        })
+    }
+
+    #[test]
+    fn a_misspelled_brush_option_is_refused() {
+        for (agree, mut s) in sessions() {
+            for src in ["b = brush{kind=\"round\", width=8, piont=1}", "work(rect(0, 0, 100, 100), {pile=pile{{\"lead white\", 1}}, tool={\"round\", 8, piont=1}, seed=1})"] {
+                match s.run(src) {
+                    Err(e) => assert!(agree && e.contains("brush: unknown option \"piont\""), "{src}: {e}"),
+                    Ok(_) => assert!(!agree, "{src} was accepted"),
+                }
+            }
+            s.run("b = brush{kind=\"round\", width=8, point=1}; c = brush{\"filbert\", 6, bristles=40}").unwrap();
+        }
+    }
+
+    #[test]
+    fn brush_and_knife_loads_refuse_the_same_amounts() {
+        for (agree, mut s) in sessions() {
+            s.run("p = pile{{\"cobalt blue\", 1}}; b = brush(\"round\", 8); k = knife{width=30}").unwrap();
+            for amount in ["-0.5", "1.5"] {
+                let knife = s.run(&format!("k:load(p, {amount})")).unwrap_err();
+                assert!(knife.contains("k:load: amount is a share of a full load (0..1)"), "{knife}");
+                for verb in ["load", "reload"] {
+                    match s.run(&format!("b:{verb}(p, {amount})")) {
+                        Err(e) => assert!(agree && e.contains(&format!("b:{verb}: amount is a share of a full load (0..1)")), "{e}"),
+                        Ok(_) => assert!(!agree, "b:{verb}(p, {amount}) was accepted"),
+                    }
+                }
+            }
+            s.run("b:load(p, 1); b:reload(p, 0)").unwrap();
+        }
+    }
+
+    #[test]
+    fn recipes_and_mixes_whose_parts_overflow_are_refused() {
+        for (agree, mut s) in sessions() {
+            match s.run("p = pile{{'lead white', 3e38}, {'cobalt blue', 3e38}}") {
+                Err(e) => assert!(agree && e.contains("pile: the parts add up to more than the easel can count"), "{e}"),
+                Ok(_) => assert!(!agree),
+            }
+            s.run("p = pile{{'lead white', 1}}; q = pile{{'cobalt blue', 1}}").unwrap();
+            match s.run("m = mix{{p, 3e38}, {q, 3e38}}") {
+                Err(e) => assert!(agree && e.contains("mix: the shares add up to more than the easel can count"), "{e}"),
+                Ok(_) => assert!(!agree),
+            }
+            s.run("p = pile{{'lead white', 1e30}, {'cobalt blue', 1e30}}; m = mix{{p, 1e30}, {q, 1e30}}").unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::session::Session;
+
+    #[test]
+    fn differently_diluted_heaps_conserve_tube_paint_and_medium() {
+        for engine in [8, 9] {
+            let log = format!("--@ engine {engine}\n--@ box every\n--@ glaze-film\n");
+            let mut s = Session::replay_with(16, crate::session::box_for(Some(&log)).unwrap()).unwrap();
+            s.run(r#"canvas{size=100, aspect=1, linen=15, seed=1, raw="cotton duck"}
+                blue = pile{{"Prussian blue", 1}, medium=0.9}
+                white = pile{{"lead white", 1}}
+                mixed = mix{{blue, 1}, {white, 1}, name="mixed"}
+                blue:add{{"lead white", 1}}"#).unwrap();
+            let st = s.st.borrow();
+            let blue = st.tubes.tubes.iter().position(|t| t.name == "Prussian blue").unwrap();
+            for h in st.board.heaps.iter().filter(|h| h.name.as_deref() == Some("mixed") || h.added) {
+                let share = h.fractions().into_iter().find(|p| p.0 == blue).unwrap().1;
+                let expected = if engine >= 9 { 1.0 / 11.0 } else { 0.5 };
+                assert!((share - expected).abs() < 1e-6, "engine {engine}: {share}");
+                assert!((h.medium - 0.45).abs() < 1e-6, "engine {engine}: {}", h.medium);
+            }
+        }
+    }
+
+    #[test]
+    fn pile_additions_do_not_depend_on_part_units() {
+        let mut s = Session::replay_with(16, crate::session::box_for(Some("--@ engine 9\n--@ box every\n")).unwrap()).unwrap();
+        s.run(r#"canvas{size=100, aspect=1, linen=15, seed=1, raw="cotton duck"}
+            for _, scale in ipairs{1, 1e-10, 1e-30} do
+                local p = pile{{"lead white", scale}}
+                p:add{{"Prussian blue", scale}}
+            end"#).unwrap();
+        for h in &s.st.borrow().board.heaps {
+            for (_, f) in h.fractions() { assert!((f - 0.5).abs() < 1e-6, "{f}"); }
+        }
+    }
+
+    fn run(src: &str) -> Result<String, String> {
+        Session::replay(200).unwrap().run(src).map(|r| r.out)
+    }
+
+    // math.random: stock Lua's errors, whole 64-bit ranges, and the draws
+    // old logs made from small ordered ranges unchanged
+    #[test]
+    fn math_random_keeps_old_draws_and_refuses_empty_ranges() {
+        let draws = r#"math.randomseed(7)
+            local t = {}
+            for _ = 1, 6 do t[#t + 1] = math.random(2, 4) end
+            for _ = 1, 3 do t[#t + 1] = math.random(100) end
+            t[#t + 1] = math.random(-3, 3)
+            t[#t + 1] = math.random(5.0)
+            t[#t + 1] = string.format("%.9f", math.random())
+            print(table.concat(t, " "))"#;
+        assert_eq!(run(draws).unwrap(), "4 4 3 2 2 3 85 32 34 0 3 0.080516815\n");
+        for (call, want) in [
+            ("math.random(5, 1)", "interval is empty"),
+            ("math.random(-5)", "interval is empty"),
+            ("math.random(1.5)", "number has no integer representation"),
+            ("math.random(1, 2, 3)", "wrong number of arguments"),
+        ] {
+            let e = run(call).unwrap_err();
+            assert!(e.contains(want), "{call}: {e}");
+        }
+        run("math.randomseed(7)
+             local a = math.random(math.mininteger, math.maxinteger)
+             assert(math.type(a) == 'integer')
+             local odd = false
+             for _ = 1, 64 do
+               local x = math.random(0, 1 << 40)
+               assert(x >= 0 and x <= 1 << 40)
+               odd = odd or x % 2 == 1
+             end
+             assert(odd, 'wide ranges reach every integer')
+             assert(math.type(math.random(0)) == 'integer')")
+        .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod blend_at_masks_tests {
+    use crate::session::{Session, box_for};
+
+    const CANVAS: &str = r#"canvas{size=400, aspect=1, linen=15, seed=7, ground={{pile={{"lead white",3},{"yellow ochre",1}}, um=120, apply="knife"}}}"#;
+
+    fn new_painting() -> Session {
+        let mut s = Session::with_box(320, box_for(None).unwrap()).unwrap();
+        s.run(CANVAS).unwrap();
+        s
+    }
+
+    fn older_log() -> Session {
+        let mut s = Session::replay_with(320, box_for(Some("--@ engine 7
+")).unwrap()).unwrap();
+        s.run(CANVAS).unwrap();
+        s
+    }
+
+    /// Mean linear luminance of the canvas over x0..x1, y0..y1 (units).
+    fn lum(s: &Session, (x0, y0, x1, y1): (f32, f32, f32, f32)) -> f32 {
+        let c = s.canvas().unwrap();
+        let (f, px) = (c.window(), c.seen());
+        let (mut sum, mut n) = (0.0, 0.0);
+        for y in (y0 * f.scale) as usize..(y1 * f.scale) as usize {
+            for x in (x0 * f.scale) as usize..(x1 * f.scale) as usize {
+                let p = px[y * f.w + x];
+                sum += 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2];
+                n += 1.0;
+            }
+        }
+        sum / n
+    }
+
+    /// A smoothstep ramp from y 200 to 300 softened by one unit, read at
+    /// y 225 and 275 (the ramp there: 0.16 and 0.84).
+    const RAMP: &str = r#"local m = mask(function(x, y) return smoothstep(200, 300, y) end):soften(1)
+print(string.format("%.3f %.3f", m:at(500, 225), m:at(500, 275)))"#;
+
+    fn ramp(s: &mut Session) -> Vec<f32> {
+        s.run(RAMP).unwrap().out.split_whitespace().map(|v| v.parse().unwrap()).collect()
+    }
+
+    /// In a new painting `soften` keeps a graded mask graded: it used to
+    /// threshold the mask at 0.5 and lay its own ramp there, so a soft
+    /// function mask came out as a hard line at its midpoint. A save keeps
+    /// this; a log from before replays its line.
+    #[test]
+    fn soften_keeps_a_graded_mask_graded() {
+        let mut s = new_painting();
+        let [lo, hi] = ramp(&mut s)[..] else { panic!() };
+        assert!((lo - 0.156).abs() < 0.02 && (hi - 0.844).abs() < 0.02, "the softened ramp is no longer graded ({lo}, {hi})");
+
+        let path = std::env::temp_dir().join(format!("easel-masks-{}.ckpt", std::process::id()));
+        let program = s.program("painting");
+        assert!(program.contains(crate::session::BLEND_MARK), "a new painting's log doesn't name its masks' blending");
+        assert_eq!(s.canvas().unwrap().engine(), paint::PIGMENT_MIXER);
+        crate::save::write(&s, &program, &path).unwrap();
+        let mut restored = crate::save::read(&path).unwrap().session;
+        let _ = std::fs::remove_file(&path);
+        assert!(restored.st.borrow().tubes.blend_at_masks);
+        let c = restored.canvas().unwrap();
+        assert_eq!(c.engine(), paint::PIGMENT_MIXER);
+        assert!(c.knife_skim() && c.blend_feather() && c.brush_skim());
+        drop(c);
+        assert!((ramp(&mut restored)[0] - 0.156).abs() < 0.02, "a restored save thresholds a softened ramp");
+
+        let [lo, hi] = ramp(&mut older_log())[..] else { panic!() };
+        assert!(lo < 0.01 && hi > 0.99, "an older log no longer replays its softened ramp as a line ({lo}, {hi})");
+    }
+
+    /// A wet dark band across a light ground, then an unclipped blend over
+    /// the band in diagonal strokes and an unclipped glaze down a narrow
+    /// strip. Returns how much darker the ground got 70 to 150 units above
+    /// the band, and 60 to 140 units beside the strip (shares of its
+    /// luminance).
+    fn reach(s: &mut Session) -> (f32, f32) {
+        s.run(r#"dk = pile{{"raw umber",2},{"bone black",1},{"lead white",0.3}}
+work(rect(100, 400, 800, 40), {hand="body", pile=dk, angle=0, coverage=3, fill=true, clip=true, seed=3})"#)
+            .unwrap();
+        let (above, beside) = ((300.0, 250.0, 700.0, 330.0), (560.0, 600.0, 640.0, 900.0));
+        let (a0, b0) = (lum(s, above), lum(s, beside));
+        s.run(r#"blend(rect(100, 400, 800, 40), {angle=-0.6, clip=false, seed=5})
+blend(rect(100, 400, 800, 40), {angle=0.6, clip=false, seed=6})
+work(rect(495, 600, 10, 300), {hand="glaze", pile=dk, angle=0, coverage=1.5, seed=7})"#)
+            .unwrap();
+        (1.0 - lum(s, above) / a0, 1.0 - lum(s, beside) / b0)
+    }
+
+    /// In a new painting an unclipped blender or glaze reaches half a brush
+    /// past its mask: it used to run its strokes their whole length (120 to
+    /// 300 units) past it, dragging the paint it picked up over whatever
+    /// lay there. A log from before replays its long reach.
+    #[test]
+    fn an_unclipped_blend_or_glaze_reaches_half_a_brush_past_its_mask() {
+        let (above, beside) = reach(&mut new_painting());
+        assert!(above < 0.01, "the unclipped blend carried paint 70 units past its mask ({above})");
+        assert!(beside < 0.01, "the unclipped glaze carried paint 60 units past its mask ({beside})");
+        let (above, beside) = reach(&mut older_log());
+        assert!(above > 0.02 && beside > 0.02, "an older log no longer replays its long reach ({above}, {beside})");
+    }
+}
+
+#[cfg(test)]
+mod reload_finite_tests {
+    use crate::session::{Session, box_for};
+
+    const CANVAS: &str = r#"canvas{size=400, aspect=1, linen=15, seed=7, ground={{pile={{"lead white",3},{"yellow ochre",1}}, um=120, apply="knife"}}}"#;
+    const LOAD: &str = r#"b = brush("filbert", 8) p = pile{{"lead white", 2}, {"yellow ochre", 1}} b:load(p, 0.5)"#;
+
+    fn new_painting() -> Session {
+        let mut s = Session::with_box(320, box_for(None).unwrap()).unwrap();
+        s.run(CANVAS).unwrap();
+        s.run(LOAD).unwrap();
+        s
+    }
+
+    fn older_log() -> Session {
+        let mut s = Session::replay_with(320, box_for(Some("--@ engine 7\n")).unwrap()).unwrap();
+        s.run(CANVAS).unwrap();
+        s.run(LOAD).unwrap();
+        s
+    }
+
+    /// In a new painting `b:reload` refuses a nonfinite amount before it
+    /// wipes the brush: it used to load the NaN, and the brush's fullness
+    /// stayed NaN. A save keeps this; a log from before replays its NaN.
+    #[test]
+    fn reload_refuses_a_nonfinite_amount() {
+        let mut s = new_painting();
+        let e = s.run("b:reload(p, 0/0)").unwrap_err();
+        assert!(e.contains("b:reload: the amount is a share of a full load (0..1)"), "{e}");
+        s.run("assert(b:fullness() == b:fullness(), 'the brush holds a NaN')").unwrap();
+
+        let path = std::env::temp_dir().join(format!("easel-reload-{}.ckpt", std::process::id()));
+        let program = s.program("painting");
+        crate::save::write(&s, &program, &path).unwrap();
+        let mut restored = crate::save::read(&path).unwrap().session;
+        let _ = std::fs::remove_file(&path);
+        restored.run(LOAD).unwrap();
+        let e = restored.run("b:reload(p, 0/0)").unwrap_err();
+        assert!(e.contains("b:reload: the amount is a share of a full load (0..1)"), "{e}");
+
+        let mut old = older_log();
+        old.run("b:reload(p, 0/0)").unwrap();
+        old.run("assert(b:fullness() ~= b:fullness(), 'an older log no longer reloads a NaN')").unwrap();
+    }
+}

@@ -1,0 +1,40 @@
+# Protected golden set: saved test answers, their inputs and the code that
+# measures them. A change to any of these between main and a candidate needs
+# an approval in refs/notes/golden-approvals by someone other than its
+# builder (scripts/golden_approve; notes/speed/SAFEGUARDS.md). One path per
+# line, or a directory prefix ending in /. This file is protected too.
+notes/thinner/baseline/
+crates/paint/src/state_dump.rs
+crates/easel/src/state_dump.rs
+notes/golden_paths.txt
+scripts/compare_images.py
+scripts/tests/image_tolerance.py
+crates/paint/tests/golden_scene.png
+crates/easel/tests/r19_default_box.png
+crates/easel/tests/r19_default_box.surface-fnv
+# Option B goldens of the shrunk tests (decision 2): computed by af49348's
+# unchanged release easel, approved by a reviewer who isn't their builder.
+crates/easel/tests/old_logs/
+scripts/tests/old_logs.sh
+# an input of the old-log case r19 (cases.tsv names it as ../r19_default_box.lua)
+crates/easel/tests/r19_default_box.lua
+# The approval tool.
+scripts/golden_approve
+scripts/safeguards_lib.py
+# The engine-against-baseline check run by scripts/test (thinner check 2's
+# command and the fast checks' baseline step).
+scripts/tests/baseline_state.sh
+# The test runner.
+scripts/test
+# The thinner acceptance tests, helpers, inputs and rules frozen at b2a0e14
+# (~/src/a/claude-paint-reviews/thinner-tests-APPROVED.md), as far as they are left.
+crates/easel/tests/thinner/dump_solvent.lua
+crates/paint/tests/thinner/tubes_af49348.txt
+crates/paint/tests/thinner_physics.rs
+crates/paint/tests/thinner_pigments.rs
+crates/paint/tests/thinner_support/mod.rs
+notes/thinner/ACCEPTANCE.md
+notes/thinner/DIAGNOSIS.md
+scripts/tests/thinner_dump_fields_test.py
+scripts/thinner_check2
+scripts/thinner_dump_fields.py

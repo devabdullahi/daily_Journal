@@ -1,0 +1,20 @@
+target/
+out/*.png
+out/*.ckpt
+out/*.ckpt.part
+out/easel/
+out/lua/
+out/**/*.png
+out/**/*.jpg
+out/easel/
+__pycache__/
+
+# runner output (logs, checks, markers): not committed; a finished painting's files are added by hand with git add -f
+notes/round*/runner/run/
+
+# Private preservation originals, raw sessions and local verification receipts.
+# Painting records live in the stillwet-paintings repositories.
+.preservation/
+
+paintings/
+archive/
