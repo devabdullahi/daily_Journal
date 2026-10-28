@@ -9,6 +9,11 @@ publish = false
 state-store = []
 render-snapshot = ["state-store", "paint/render-snapshot"]
 
+[lib]
+name = "easel_ios"
+path = "src/main.rs"
+crate-type = ["staticlib"]
+
 [[bin]]
 name = "easel"
 path = "src/main.rs"

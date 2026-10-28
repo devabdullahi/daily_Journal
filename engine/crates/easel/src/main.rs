@@ -2997,3 +2997,29 @@ mod tests {
         }
     }
 }
+
+
+/// iOS spike: runs `easel <args...>` in-process (the shell's argv without the program name).
+#[unsafe(no_mangle)]
+pub extern "C" fn easel_run_c(argc: i32, argv: *const *const std::ffi::c_char) -> i32 {
+    let args: Vec<String> = (0..argc as isize)
+        .map(|i| unsafe { std::ffi::CStr::from_ptr(*argv.offset(i)) }.to_string_lossy().into_owned())
+        .collect();
+    static LOADED: std::sync::Once = std::sync::Once::new();
+    let mut load_err = None;
+    LOADED.call_once(|| load_err = studio::load().err());
+    if let Some(e) = load_err {
+        eprintln!("{e}");
+        return 1;
+    }
+    match args.first().map(String::as_str) {
+        Some("run") => match run(&args[1..]) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("{e}");
+                1
+            }
+        },
+        _ => 2,
+    }
+}
