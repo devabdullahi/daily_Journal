@@ -138,6 +138,9 @@ impl Latent {
     pub(crate) fn from_layers(mut layers: Vec<Layer>) -> (f32, Self, Prop) {
         layers.retain(|l| l.share > 0.0);
         let (mut volume, mut lat, mut hide) = (0.0, Self::default(), [0.0; 10]);
+        // (room for the parts up front: the mix pushes them one by one)
+        let parts = layers.iter().map(|l| l.lat.parts.len()).max().unwrap_or(0);
+        if parts > 0 { lat.parts.reserve(parts + 2); }
         for layer in &layers {
             mix_into(&mut volume, &mut lat, &mut hide, layer.share, &layer.lat, layer.hide);
         }
@@ -148,8 +151,33 @@ impl Latent {
         (volume, lat, hide)
     }
 
+    /// `layers`, consuming the latent: its layers are reused in place rather
+    /// than cloned (same values, same arithmetic).
+    pub(crate) fn into_layers(mut self, volume: f32, hide: Prop) -> Vec<Layer> {
+        if self.layers.is_empty() {
+            return vec![Layer { share: volume, lat: self, hide }];
+        }
+        let scatter: f32 = self.layers.iter().map(|l| l.share * l.hide[0]).sum();
+        let scale = if scatter > 0.0 { hide[0] / scatter } else { 1.0 };
+        let mut layers = std::mem::take(&mut self.layers);
+        for l in &mut layers {
+            l.share *= volume;
+            l.hide[0] *= scale;
+        }
+        layers
+    }
+
     pub(crate) fn split_top(&self, volume: f32, hide: Prop, take: f32, drain: bool) -> (Vec<Layer>, Vec<Layer>) {
-        let mut below = self.layers(volume, hide);
+        Self::split_off_top(self.layers(volume, hide), volume, take, drain)
+    }
+
+    /// `split_top`, consuming the latent (for a pixel about to be rewritten
+    /// from the two halves): no copy of its layers.
+    pub(crate) fn split_top_owned(self, volume: f32, hide: Prop, take: f32, drain: bool) -> (Vec<Layer>, Vec<Layer>) {
+        Self::split_off_top(self.into_layers(volume, hide), volume, take, drain)
+    }
+
+    fn split_off_top(mut below: Vec<Layer>, volume: f32, take: f32, drain: bool) -> (Vec<Layer>, Vec<Layer>) {
         let mut top = Vec::new();
         let mut left = take.min(volume).max(0.0);
         while left > 0.0 {

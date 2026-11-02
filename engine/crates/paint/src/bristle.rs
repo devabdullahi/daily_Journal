@@ -938,13 +938,14 @@ impl Surf {
     pub(crate) unsafe fn lay_layers(&self, i: usize, v: f32, lat: &Latent, hide: Prop, cure: f32, skim: f32) {
         if v <= 0.0 { return; }
         unsafe {
-            let (mut below, top) = (*self.lat.add(i)).split_top(*self.vol.add(i), *self.hide.add(i), skim, self.drain);
+            // (the pixel's latent is rewritten from the halves: move it, don't copy it)
+            let (mut below, top) = std::mem::take(&mut *self.lat.add(i)).split_top_owned(*self.vol.add(i), *self.hide.add(i), skim, self.drain);
             let (volume, pigment, properties) = Latent::from_layers(top);
             *self.vol.add(i) = volume;
             *self.lat.add(i) = pigment;
             *self.hide.add(i) = properties;
             self.add(i, v, lat, hide, cure);
-            let mut pigment = (*self.lat.add(i)).clone();
+            let mut pigment = std::mem::take(&mut *self.lat.add(i));
             pigment.layers.clear();
             below.push(crate::wet::Layer { share: *self.vol.add(i), lat: pigment, hide: *self.hide.add(i) });
             let (volume, pigment, properties) = Latent::from_layers(below);
@@ -986,7 +987,7 @@ impl Surf {
             self.film_give(i, v);
             let vol = &mut *self.vol.add(i);
             if self.layers && !(*self.lat.add(i)).layers.is_empty() {
-                let (below, top) = (*self.lat.add(i)).split_top(*vol, *self.hide.add(i), v, self.drain);
+                let (below, top) = std::mem::take(&mut *self.lat.add(i)).split_top_owned(*vol, *self.hide.add(i), v, self.drain);
                 let (_, mut picked, got) = Latent::from_layers(top);
                 picked.layers = Vec::new();
                 let (left, lat, hide) = Latent::from_layers(below);
