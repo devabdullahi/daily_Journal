@@ -54,6 +54,44 @@ mod latent_tests {
     use super::*;
 
     #[test]
+    fn add_parts_matches_a_search_per_part() {
+        fn reference(parts: &mut Vec<(usize, f32)>, other: &[(usize, f32)], weight: f32) {
+            for &(i, f) in other {
+                match parts.iter_mut().find(|p| p.0 == i) {
+                    Some(p) => p.1 += f * weight,
+                    None => parts.push((i, f * weight)),
+                }
+            }
+        }
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for _ in 0..20_000 {
+            // small tube ranges force repeats; some indices from 64 up
+            let range = [4, 8, 70, 130][next(4) as usize];
+            let mut lists = [Vec::new(), Vec::new()];
+            for list in &mut lists {
+                for _ in 0..next(10) {
+                    let tube = next(range) as usize;
+                    list.push((tube, (next(1000) as f32 + 1.0) / 997.0));
+                }
+            }
+            let [a, b] = lists;
+            let (mut here, other) = (Latent::default(), Latent { parts: b.clone(), ..Latent::default() });
+            here.parts = a.clone();
+            let weight = next(1000) as f32 / 1000.0;
+            here.add_parts(&other, weight);
+            let mut expected = a;
+            reference(&mut expected, &b, weight);
+            assert_eq!(here.parts.iter().map(|p| (p.0, p.1.to_bits())).collect::<Vec<_>>(), expected.iter().map(|p| (p.0, p.1.to_bits())).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
     fn legacy_debug_keeps_twenty_one_lanes() {
         let latent = Latent::default();
         assert_eq!(format!("{latent:?}"), format!("{:?}", [0.0f32; crate::mixer::LEGACY_LATENT_SIZE]));
@@ -211,11 +249,34 @@ impl Latent {
     }
 
     pub(crate) fn add_parts(&mut self, other: &Self, weight: f32) {
-        for &(i, f) in &other.parts {
-            match self.parts.iter_mut().find(|p| p.0 == i) {
-                Some(p) => p.1 += f * weight,
-                None => self.parts.push((i, f * weight)),
+        // Each part of `other` adds to the first part here naming its tube,
+        // or is appended. Same result as a search per part, found faster: a
+        // bit per tube (indices below 64) says whether a search can match at
+        // all, and while no tube here is repeated, a match at the same
+        // position is the only one (blending a pile into itself, the common
+        // case). Indices from 64 up always search.
+        let mut mask = 0u64;
+        let mut unique = true;
+        for p in &self.parts {
+            if p.0 < 64 {
+                unique &= mask & (1 << p.0) == 0;
+                mask |= 1 << p.0;
             }
+        }
+        for (j, &(i, f)) in other.parts.iter().enumerate() {
+            let known = i >= 64 || mask & (1 << i) != 0;
+            if known {
+                if unique && i < 64 && self.parts.get(j).is_some_and(|p| p.0 == i) {
+                    self.parts[j].1 += f * weight;
+                    continue;
+                }
+                if let Some(p) = self.parts.iter_mut().find(|p| p.0 == i) {
+                    p.1 += f * weight;
+                    continue;
+                }
+            }
+            self.parts.push((i, f * weight));
+            if i < 64 { mask |= 1 << i; }
         }
     }
 
