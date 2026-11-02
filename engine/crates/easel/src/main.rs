@@ -2999,6 +2999,42 @@ mod tests {
 }
 
 
+/// Global rayon pool for the app build, configured once per process from the
+/// environment (unset: rayon's defaults, as before):
+/// `EASEL_THREADS=N` sets the worker count; `EASEL_QOS=user-initiated` (or
+/// `user-interactive`) gives the workers that Apple QoS class. Darwin threads
+/// don't inherit the creator's QoS: rayon workers otherwise run at
+/// QOS_CLASS_DEFAULT, below the app's user-initiated caller.
+fn configure_ios_pool() {
+    let threads = std::env::var("EASEL_THREADS").ok().and_then(|v| v.parse::<usize>().ok());
+    let qos = std::env::var("EASEL_QOS").ok();
+    if threads.is_none() && qos.is_none() {
+        return;
+    }
+    let mut b = rayon::ThreadPoolBuilder::new().thread_name(|n| format!("easel-w{n}"));
+    if let Some(n) = threads {
+        b = b.num_threads(n);
+    }
+    #[cfg(target_vendor = "apple")]
+    if let Some(class) = qos.as_deref().and_then(|q| match q {
+        "user-interactive" => Some(0x21u32),
+        "user-initiated" => Some(0x19u32),
+        "default" => Some(0x15u32),
+        "utility" => Some(0x11u32),
+        _ => None,
+    }) {
+        unsafe extern "C" {
+            fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+        }
+        b = b.start_handler(move |_| unsafe {
+            pthread_set_qos_class_self_np(class, 0);
+        });
+    }
+    if let Err(e) = b.build_global() {
+        eprintln!("easel: global pool not configured: {e}");
+    }
+}
+
 /// iOS spike: runs `easel <args...>` in-process (the shell's argv without the program name).
 #[unsafe(no_mangle)]
 pub extern "C" fn easel_run_c(argc: i32, argv: *const *const std::ffi::c_char) -> i32 {
@@ -3007,7 +3043,10 @@ pub extern "C" fn easel_run_c(argc: i32, argv: *const *const std::ffi::c_char) -
         .collect();
     static LOADED: std::sync::Once = std::sync::Once::new();
     let mut load_err = None;
-    LOADED.call_once(|| load_err = studio::load().err());
+    LOADED.call_once(|| {
+        configure_ios_pool();
+        load_err = studio::load().err();
+    });
     if let Some(e) = load_err {
         eprintln!("{e}");
         return 1;
