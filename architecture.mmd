@@ -1,0 +1,53 @@
+flowchart LR
+    subgraph Phone["iPhone app (Swift / SwiftUI, local-first)"]
+        Journal["Journal + local store<br/>entries saved first"]
+        Reader{"Reader<br/>Foundation Models,<br/>opt-in Haiku, or fallback"}
+        PhonePlanner["Rust planner + engine<br/>shared crate via UniFFI<br/>live timelapse"]
+        Gate{"Passed feasibility<br/>gate?"}
+        Gallery["Gallery + reveal<br/>released art only"]
+        Widget["Widget<br/>privacy-safe snapshot"]
+        Purchase["StoreKit 2"]
+    end
+
+    subgraph Worker["Cloudflare Worker (TypeScript, modular monolith, layered)"]
+        API["API<br/>auth, entries, readings, billing"]
+        Outbox[["Outbox + reconciler"]]
+        ChapterWF["Chapter Workflow<br/>gather, plan, paint, store, notify"]
+        YearWF["Year Workflow<br/>close ch.12, plan, paint, hold"]
+        RevealGate["Reveal gate<br/>release auth on every path"]
+        Queue[["Queue<br/>fallback daily paints"]]
+        DB[("D1<br/>status (source of truth),<br/>Readings, anchors")]
+        R2[("R2<br/>paintings, stroke logs")]
+    end
+
+    subgraph Painter["Painter container (Linux)"]
+        ServerPlanner["Rust planner + engine<br/>same crate"]
+    end
+
+    Haiku["Claude Haiku<br/>opt-in cloud reading"]
+
+    Journal --> Reader
+    Reader -- "Reading" --> Gate
+    Gate -- "yes" --> PhonePlanner
+    Gate -- "no" --> API
+    PhonePlanner -- "painting + stroke log" --> API
+    Journal -- "encrypted sync" --> API
+    Reader -. "opt-in text" .-> API
+    API -. "opt-in text" .-> Haiku
+    Purchase -- "entitlement" --> API
+    API --> DB
+    API --> R2
+    API --> Queue
+    Queue --> ServerPlanner
+
+    DB -- "period closed" --> Outbox
+    Outbox --> ChapterWF
+    Outbox --> YearWF
+    ChapterWF -- "paint job" --> ServerPlanner
+    YearWF -- "paint job" --> ServerPlanner
+    ServerPlanner -- "art + status" --> R2
+    ServerPlanner --> DB
+    YearWF --> RevealGate
+    RevealGate -- "signed URLs after release" --> Gallery
+    R2 --> Gallery
+    R2 --> Widget

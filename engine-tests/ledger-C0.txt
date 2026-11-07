@@ -1,0 +1,2 @@
+C0-baseline bench_v3c w=512 runs=5 median=27.47s min=27.33s max=27.98s png=414c900a5ebb4428
+C0-baseline bench_v2 w=512 runs=5 median=27.53s min=27.49s max=27.99s png=f823e31c88dacb83

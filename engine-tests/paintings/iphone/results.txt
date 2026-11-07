@@ -1,0 +1,3 @@
+device=iPhone18,2 cores=6
+v1-512 ok=true seconds=2.92 peakMB=235 thermal=nominal
+v2-512 ok=true seconds=13.97 peakMB=262 thermal=nominal

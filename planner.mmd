@@ -1,0 +1,40 @@
+flowchart TB
+    subgraph Readers["Readers (platform-specific AI)"]
+        FM["Apple Foundation Models<br/>on device"]
+        HK["Claude Haiku<br/>opt-in cloud"]
+        FB["Private deterministic<br/>fallback"]
+    end
+
+    Reading[["Reading<br/>versioned schema, sensitive"]]
+
+    subgraph Crate["Shared Rust crate (iOS + Linux), behind UniFFI / C ABI"]
+        Plan["plan(reading, level, canvas, seed)"]
+        subgraph Comps["Static composition lists (a few strong ones each)"]
+            Day["Day compositions"]
+            Chapter["Chapter compositions"]
+            Year["Year layouts<br/>fixed big shapes, 12 period slots,<br/>quiet slot for empty periods"]
+        end
+        Validate["Validate<br/>paintable, stroke and time budget"]
+        PaintPlan[["PaintPlan<br/>versioned, canonicalized"]]
+        Engine["claude-paint engine<br/>pinned version"]
+    end
+
+    Out["Image + stroke log<br/>+ provenance: engine, plan, Reading versions, seed"]
+    Tests["Tests<br/>plan parity across targets,<br/>golden plans + golden images"]
+
+    FM --> Reading
+    HK --> Reading
+    FB --> Reading
+    Reading --> Plan
+    Plan --> Day
+    Plan --> Chapter
+    Plan --> Year
+    Day --> Validate
+    Chapter --> Validate
+    Year --> Validate
+    Validate -- "fail: next composition" --> Plan
+    Validate --> PaintPlan
+    PaintPlan --> Engine
+    Engine --> Out
+    Tests -.-> PaintPlan
+    Tests -.-> Engine

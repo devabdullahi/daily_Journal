@@ -1,0 +1,7 @@
+{
+  "slug": "oil-paint-engine-on-iphone",
+  "title": "Porting a physical oil-paint engine to the iPhone without changing a pixel",
+  "deck": "How my journal app paints every day as a real simulated oil painting, and what it took to make a Rust paint engine fast on a phone: plans beat physics, LTO made it slower, and the 20× slowdown was iOS.",
+  "category": "Engineering",
+  "date": "2026-11-06"
+}

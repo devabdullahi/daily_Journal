@@ -1,0 +1,185 @@
+<figure><img src="images/01-hero.jpg" alt="Three oil paintings made by the engine: an orange sunset over a wet street with a figure holding an umbrella, a dim room with a rainy window, a desk lamp and an exam paper, and a park with a tree and a big ice cream cone."><figcaption>Three journal entries, three paintings. No photos, no image model: every pixel is simulated wet paint.</figcaption></figure>
+
+<p>I've been building an iOS journal where every day you write becomes a small oil painting. Each month's days get woven into a bigger "chapter" painting, and on your one-year anniversary the twelve chapters become one large painting of your year. That's the product pitch. This post is about the part I've spent the most time on: the paint engine underneath it, and what it took to get a physical oil-paint simulator running on an iPhone at a speed you'd actually want to sit and watch.</p>
+
+<p>Short version: the engine was already great, the hard parts were somewhere else, and the biggest "performance bug" I found wasn't in the engine at all.</p>
+
+<h2>Why simulate paint at all?</h2>
+
+<p>The obvious way to turn text into a picture in 2026 is an image-generation model. I didn't want that, for three reasons:</p>
+
+<ul>
+<li><strong>The look.</strong> Generated "oil painting style" images look like a filter. I wanted paint that actually behaves like paint: bristle marks, wet colors dragging into each other, thick passages and thin glazes.</li>
+<li><strong>The process.</strong> A real painting has a history. If the engine paints stroke by stroke, the timelapse of your day being painted comes for free, and it turns out that's the best part of the app.</li>
+<li><strong>Determinism.</strong> Same plan + same seed = same painting. That makes it testable, which matters a lot later in this post.</li>
+</ul>
+
+<p>So I built on <a href="https://github.com/aliceisjustplaying/claude-paint">claude-paint</a>, an MIT-licensed physical oil-paint simulator in Rust by aliceisjustplaying. I want to be clear about credit here: the physics is not mine. Simulated bristles carry wet paint across a primed linen canvas, paint levels and dries on a clock, and layers combine with Kubelka–Munk optics, the same absorption-and-scattering model real pigment mixing follows. You don't pick an RGB color. You knife a pile together from named historical tubes (lead white, vermilion, Prussian blue, raw umber…) and paint with that.</p>
+
+<p>My work is everything around it: the planner that turns a journal entry into a painting plan, the iOS build, and a fork of the engine tuned for the phone.</p>
+
+<h2>The pipeline</h2>
+
+<figure><img src="images/d01-pipeline.png" alt="Diagram: journal entry goes to an AI reader, which produces a structured Reading. A shared Rust crate holds the planner, which produces a PaintPlan of Lua chunks, which the claude-paint engine paints into a PNG, stroke log, timelapse frames and provenance."><figcaption>AI only reads. Planning is deterministic Rust, and painting is the engine.</figcaption></figure>
+
+<p>An AI model (Apple's on-device Foundation Models, or Claude Haiku if the user opts in) reads the entry and produces a small structured <em>Reading</em>: subject, setting, light, mood colors, key motifs. From there everything is deterministic code. A planner picks a composition and writes a <em>PaintPlan</em>, which is a Lua script the engine's easel replays:</p>
+
+<pre><code>sky = horizon:above()
+-- sky in three bands with soft overlaps, so blue never mixes into orange
+high = sky * above(function(x) return 260 end):soften(80)
+blue  = pile{{"cobalt blue", 1}, {"lead white", 2.5}}
+amber = pile{{"chrome yellow", 1}, {"vermilion", 0.7}, {"lead white", 1.2}}
+work(high, {hand="broad", pile=blue, angle=0.05, coverage=2, fill=true})
+work(low,  {hand="broad", pile=amber, angle=0.03, coverage=2.2, fill=true})
+blend(sky, {angle=0})</code></pre>
+
+<p>The planner and the engine live in one Rust crate compiled for both iOS and a Linux "painter" container on Cloudflare. One implementation means the phone and server can't drift apart, and a parity test checks that the same Reading and seed produce the same plan on both.</p>
+
+<p>The first thing that surprised me: <code>easel run plan.lua --out painting.png</code> just works headlessly. No agent in the loop, no MCP. And <code>--frames-every</code> gives timelapse frames for free.</p>
+
+<h2>Lesson 1: the plan matters more than the engine</h2>
+
+<p>My test entry was: <em>"rough morning, missed the bus in the rain. lunch w/ sam fixed it tho. long walk home, sky was orange"</em>. Here's my first naive plan next to the second one:</p>
+
+<figure><img src="images/02-v1-vs-v2.jpg" alt="Left: a blotchy painting with bare canvas showing between strokes and muddy olive where blue met orange. Right: a clean sunset with separate blue, pink and orange bands, a dark street, a sun and a figure with an umbrella."><figcaption>Same entry, same engine. Left: one pass per area. Right: a plan that paints the way a painter would.</figcaption></figure>
+
+<p>The left one looks broken, but the engine is doing exactly what real paint does. Blue dragged through wet orange makes olive mud. Sparse strokes leave bare canvas. Both are <em>planning</em> mistakes. The fix was painter technique encoded as rules: never mix complementaries in one pass, paint the sky as separate bands with soft-masked overlaps, fill body passes, only blend where you want wet-on-wet.</p>
+
+<p>That turned into a color rulebook for the planner, mapped to the tubes the engine actually has. There are no cadmiums or phthalos in a historical tube box, so "bright greens from a cool blue and a cool yellow" becomes Prussian blue + chrome yellow, and "don't darken with black" becomes raw umber + cobalt instead of bone black.</p>
+
+<p>Some rules only came from painting things wrong. My favorite:</p>
+
+<figure><img src="images/06-green-cone.jpg" alt="Two park paintings with an ice cream cone. In the left one the cone and the path are tinted green. In the right one the cone is pink and tan and the path is a clean sandy color."><figcaption>Left: the ice cream painted over wet grass picked up the green. Right: the cone's area reserved on clean canvas.</figcaption></figure>
+
+<p>The cone was painted on top of wet grass, so the bristles dragged green into it, exactly like a real brush would. The rule now: <strong>reserve space</strong>. Foreground objects are subtracted from background passes and painted on clean canvas.</p>
+
+<h2>Watching it paint is the feature</h2>
+
+<figure><img src="images/03-timelapse.jpg" alt="Five frames of the sunset painting being built: the blue sky band over bare pink canvas, then the full sky, then the dark street, then the sun and its reflection, then the walking figure."><figcaption>Frames from one run, one per plan chunk: sky, street, reflection and sun, then the figure.</figcaption></figure>
+
+<p>Early on I had a target of 5–7 seconds per painting. Then I watched a timelapse and changed my mind. Seeing your day get painted, layer by layer, is the moment the app is about. So the target became <strong>about 30 seconds, streamed live</strong>, and "make it faster" turned into "make the phone as fast as the Mac, and don't touch the quality."</p>
+
+<h2>Lesson 2: quality means "does it say what I wrote"</h2>
+
+<p>Before optimizing anything I needed to define what "no quality loss" means, because some speedups (fewer bristles, smaller canvas) do change the picture. My first instinct was aesthetic: is it pretty? That's the wrong question for a journal. A painting is good if it <em>translates the entry</em>.</p>
+
+<figure><img src="images/05-literal-vs-abstract.jpg" alt="Left: a literal room scene with a rainy window, a lamp, a test paper and a book. Right: an abstract blue painting of tall grass with dark wavy vertical marks."><figcaption>"Failed an exam" two ways. Left: literal. Right: the abstract-emotion version I tried and dropped.</figcaption></figure>
+
+<p>I tried an abstract-emotion direction for a "failed an exam" entry (right) and went back to literal: paint the day's strongest scene, and let light, color and weather carry the feeling. You should be able to look at the painting and know which day it was.</p>
+
+<p>So the quality gate became:</p>
+
+<ul>
+<li><strong>A frozen checklist per test entry</strong> ("orange evening sky", "wet street", "a walking figure"), written before any candidate is judged.</li>
+<li><strong>A matching test:</strong> one painting, four entries, which one is it?</li>
+<li><strong>A blinded vision-model screen</strong> with a fixed model, prompt and image size, and humans adjudicating anything it flags.</li>
+</ul>
+
+<p>And every change is classified first. <strong>Exact</strong> changes (compiler flags, memory fixes, loop rewrites) must not change the picture: every pixel within 2/255 of the reference, using the engine's own comparison script. <strong>Approximate</strong> changes go through the checklist. Everything below turned out to be exact.</p>
+
+<h2>Getting it on the phone</h2>
+
+<p>The iOS port was less dramatic than I expected. I built the engine unmodified as a static library, added one C entry point (<code>easel_run_c</code>), and called it from a throwaway SwiftUI bench app on an iPhone 17 Pro Max. First numbers: 2.9 s and 14 s at 512 px, the same as my M4 Mac. Peak memory around 250 MB. Thermals nominal.</p>
+
+<p>Too good to be true, and it was. My test plans were missing a header that tells the easel which engine version to run:</p>
+
+<pre><code>--@ engine 9
+--@ knife-skim
+--@ palette-carried-paint
+--@ glaze-film
+--@ liquid-film-levels
+-- …</code></pre>
+
+<p>Without it, the easel falls back to legacy mode with fewer physics features. With engine 9 (knife skim, carried palette paint, liquid film levels and more), a 512 px painting took <strong>27.5 s on the Mac</strong>, twice as long. Every number from here on is engine 9. Lesson: before you benchmark, check that you're benchmarking the thing you'll ship.</p>
+
+<h2>Where the time goes</h2>
+
+<p>The first profile (macOS <code>sample</code>, then Instruments on the phone) was clear:</p>
+
+<figure><img src="images/d02-hot-path.png" alt="Diagram: a stroke drives many bristles; each bristle touching each pixel runs exchange::contact. A pixel holds a Vec of Layers; each layer holds a Latent with a Vec of tube parts and weights. Kubelka–Munk turns layers into color. Stats: 95% of time in contact, about 1 billion heap allocations per painting, about 30% of time in allocation and copy work."><figcaption>The hot path. Tube names and weights in the pixel are illustrative.</figcaption></figure>
+
+<p>95% of engine time is in one function, <code>exchange::contact</code>: a bristle touching a pixel, taking paint off and laying paint down. Each pixel is a stack of paint layers (<code>Vec&lt;Layer&gt;</code>), and each layer's pigment is a list of tube parts (2–9 of them). A single 512 px painting does about 290 million pixel paint operations, and adds up to roughly <strong>a billion heap allocations</strong>. About 30% of the time was malloc, free, memmove and clones.</p>
+
+<p>The other number: the engine averaged about 1.35 of 10 cores on the Mac. There is rayon parallelism for pixel ops and non-overlapping strokes, but broad overlapping strokes (a sky, a field) run serially.</p>
+
+<h2>What didn't work</h2>
+
+<p>I'm putting these first because they were the most educational.</p>
+
+<h3>LTO and one codegen unit: slower</h3>
+
+<pre><code>[profile.phone]
+inherits = "release"
+incremental = false
+codegen-units = 1
+lto = "fat"</code></pre>
+
+<p>The standard "free speed" recipe. Result: byte-identical output and <strong>2.7–4.2% slower</strong>. The time is in a handful of hot functions the normal release build already optimizes inside their own module, so cross-crate inlining had nothing to add, and the different code layout cost a little. Rejected, and logged as rejected.</p>
+
+<h3>SmallVec for tube parts: much slower</h3>
+
+<p>"A billion allocations? Inline the small vectors!" I swapped <code>Latent::parts</code> to a <code>SmallVec&lt;[(usize, f32); 10]&gt;</code>. Exact output, and the Mac run went from <strong>29.5 s to 38.1 s</strong>. Each latent grew from ~240 to ~384 bytes, and the engine copies latents constantly. Bigger copies cost more than the allocations they saved. Allocation counts are a symptom; the real question is how much memory you move.</p>
+
+<h2>The phone mystery: 76 seconds for an ice cream cone</h2>
+
+<p>Most of each painting ran at Mac speed on the phone, but some chunks were 5–20× slower. The cone took 76 s against 3.6 s on the Mac. Clouds took 110 s. One run got killed by iOS after more than 15 minutes. I had a list of suspects: efficiency cores, thermal throttling, memory pressure, some iOS-only code path.</p>
+
+<p>It was none of them. <strong>iOS suspends every thread of an app that leaves the screen.</strong> Long benchmarks plus a phone on the desk meant the screen locked or I switched apps, and the painting just froze. My own thread sampler, which does no painting, stopped too, and that gave it away. With the app kept on screen (<code>isIdleTimerDisabled</code> during a paint), no chunk was more than 1.6× slower than on the Mac, and the output was <strong>byte-identical</strong> to the Mac's: 0 of 262,144 pixels different.</p>
+
+<p>Two real findings came out of the instrumentation:</p>
+
+<ul>
+<li>The phone is about <strong>1.45× slower than the M4, evenly</strong>, on every chunk. No phone-specific fault left.</li>
+<li>Rayon's workers ran at <code>QOS_CLASS_DEFAULT</code>. Darwin threads don't inherit the app's user-initiated QoS. I added two env knobs to the C entry point, <code>EASEL_THREADS</code> and <code>EASEL_QOS</code>, and swept them:</li>
+</ul>
+
+<figure><img src="images/d05-threads.png" alt="Bar chart of iPhone painting times. 6 threads user-initiated 41.8 s; 6 threads default QoS 43.6 s; 3 threads user-initiated 48.3 s; 2 threads user-initiated 51.7 s; 2 threads default 52.2 s."><figcaption>Fewer threads are worse: the four efficiency cores do real work. User-initiated QoS helps a little on a cool phone.</figcaption></figure>
+
+<p>Keep all six threads, set user-initiated QoS, move on. It isn't the fix, just not leaving free performance on the table.</p>
+
+<h2>What did work: stop copying paint</h2>
+
+<h3>M1: move the pixel's layers instead of cloning them</h3>
+
+<figure><img src="images/d03-copy-vs-move.png" alt="Diagram comparing before and after. Before: clone the whole layer stack, split it into two new halves, rebuild the pixel, drop the original. After: mem::take the latent, split it in place, rebuild with parts reserved up front, nothing left to free."><figcaption>The classic Rust perf bug: cloning something you're about to throw away.</figcaption></figure>
+
+<p>When a bristle takes paint from a layered pixel, the engine splits the pixel's stack into "below" and "top" and rebuilds the pixel from the halves. It cloned the whole stack first, then dropped the original. The fix is mostly one word:</p>
+
+<pre><code>// before
+let (mut below, top) = (*self.lat.add(i)).split_top(vol, hide, skim, drain);
+// after: the pixel is rewritten from the halves, so move it, don't copy it
+let (mut below, top) = std::mem::take(&amp;mut *self.lat.add(i))
+    .split_top_owned(vol, hide, skim, drain);</code></pre>
+
+<p>Plus a consuming <code>into_layers</code> that reuses the layer vector in place, and <code>from_layers</code> reserving room for tube parts up front. Same values, same arithmetic, same order. About 10% faster on both machines, zero pixels changed.</p>
+
+<h3>M2: skip searches that can't match</h3>
+
+<p>Next up was <code>Latent::blend_parts</code>, ~21% of self time on the Mac. When paint mixes into a pixel, <code>add_parts</code> searched the pixel's tube list once per incoming part. Now a 64-bit mask records which tubes the pixel has, so a search that can't match is skipped. When the pixel names no tube twice, a match at the same index is the only possible one. Repeated tubes and indices ≥ 64 fall back to the old search. A property test checks it bit for bit against the old code on 20,000 random part lists, repeats and large indices included.</p>
+
+<figure><img src="images/d04-speed.png" alt="Grouped bar chart. Baseline: Mac 29.7 s, iPhone 43.6 s. M1 move layers: Mac 26.8 s, iPhone 38.9 s. M2 faster part merge: Mac 25.4 s, iPhone 34.5 s. A dashed line marks the 30 second target."><figcaption>v7 park plan at 512 px. Mac bars are the middle of each 3-run range, iPhone bars the median.</figcaption></figure>
+
+<p>Mac: 29.7 → 25.4 s. iPhone: 43.6 → 34.5 s. Both changes exact, byte-identical on both devices.</p>
+
+<h2>Where it stands</h2>
+
+<p>The phone is ~4.5 s off the 30 s target. Since it runs this engine an even 1.45× slower than the Mac, getting there means a Mac time of about 21 s, which means more of the same: the rest of the paint-layer memory churn, tighter inner loops in exchange/add/take, and wider parallelism (only about two cores are busy, and the phone's efficiency cores clearly have room).</p>
+
+<p>Things I'm explicitly <em>not</em> doing: a GPU/Metal port (mutable layered paint state plus deterministic replay makes it high risk for unclear gain), a lighter "lookalike" engine, or approximate levers like fewer bristles. The 30 s is meant to be watched.</p>
+
+<p>After that comes the fun part: <strong>living paintings</strong>. The engine paints once, and the app animates a few eligible paintings cheaply at 60 fps. Rain streaks pre-painted by the engine at build time and clipped to a window's glass, or a sky that drifts a few pixels inside a fixed, feathered region. No cutouts, no moving people, and the first frame is exactly the still.</p>
+
+<h2>Takeaways</h2>
+
+<ul>
+<li><strong>Measure the thing you ship.</strong> A missing header made my first benchmarks 2× too optimistic.</li>
+<li><strong>Your platform can be the bug.</strong> A 20× "slowdown" was iOS suspending the app. Sample something that does no work, and you'll see the stall for what it is.</li>
+<li><strong>Classify changes before you make them.</strong> "Exact, must be byte-identical" vs "approximate, must pass the checklist" kept every speedup honest.</li>
+<li><strong>Log the failures.</strong> LTO and SmallVec both "should" have helped. Both made it slower, and the ledger says why.</li>
+<li><strong>Cloning something you're about to drop is the most Rust perf bug there is.</strong> <code>mem::take</code> is your friend.</li>
+<li><strong>In a simulation, the input is the art.</strong> Most of the quality came from the planner, not the physics.</li>
+</ul>
+
+<hr>
+
+<p><em>The paint engine is <a href="https://github.com/aliceisjustplaying/claude-paint">claude-paint</a> by aliceisjustplaying (MIT; its third-party notices cover the spectral.js port and CC BY 4.0 pigment data). My fork adds the iOS static library and the performance changes above. Design decisions were argued out with Claude and Codex as sparring partners, and every number here comes from the project's benchmark ledger.</em></p>

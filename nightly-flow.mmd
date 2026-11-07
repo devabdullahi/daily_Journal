@@ -1,0 +1,55 @@
+sequenceDiagram
+    actor User
+    participant App as iPhone app
+    participant Rd as Reader (on device)
+    participant RP as Rust planner + engine (phone)
+    participant API as Worker API
+    participant H as Claude Haiku (opt-in)
+    participant WF as Workflows
+    participant SP as Painter container
+    participant DB as D1 + R2
+
+    Note over User,DB: Every day: daily painting (request-response)
+    User->>App: Write entry, tap mood, Paint
+    App->>App: Save entry locally first
+    alt Foundation Models available
+        App->>Rd: Entry text
+        Rd-->>App: Reading
+    else Opted in to cloud reading
+        App->>API: Entry text (bounded timeout)
+        API->>H: Entry text
+        H-->>API: Reading
+        API-->>App: Reading
+    else Private fallback
+        App->>App: Deterministic reader, Reading
+    end
+    alt Device passed feasibility gate
+        App->>RP: plan + paint (Reading, seed)
+        RP-->>App: Live timelapse, painting, stroke log
+        App->>API: Sync painting, Reading, provenance
+    else Not yet proven
+        App->>API: Reading (fallback paint)
+        API->>SP: Queue fallback paint
+        SP->>DB: Painting + stroke log, status
+        API-->>App: Ready, replay stroke log
+    end
+    API->>DB: Store status (source of truth)
+
+    Note over User,DB: Each user's period close: chapter
+    App->>User: Pending-sync / missing days shown (grace window)
+    DB->>WF: Period closed, via outbox (key: user, chapter, period, inputVersion)
+    WF->>DB: Gather synced Readings
+    WF->>SP: Plan + paint chapter
+    SP->>DB: Chapter painting + provenance
+    WF-->>App: "Your month is ready"
+
+    Note over User,DB: Signup anniversary: year
+    DB->>WF: Anniversary reached, via outbox
+    WF->>WF: Close chapter 12
+    WF->>SP: Plan into a 12-slot layout, paint
+    SP->>DB: Year painting (held, unreleased)
+    WF->>WF: Optional constrained vision check (opt-in), at most 1 retry
+    WF-->>App: Reveal begins (progress, then release)
+    App->>API: Request reveal
+    API->>API: Release authorization
+    API-->>App: Signed URL, chapters gather, year painting appears

@@ -1,0 +1,2 @@
+C1-lto-cgu1 bench_v3c w=512 runs=5 median=28.22s min=28.08s max=28.29s png=414c900a5ebb4428
+C1-lto-cgu1 bench_v2 w=512 runs=5 median=28.70s min=28.47s max=29.01s png=f823e31c88dacb83
